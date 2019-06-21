@@ -1,14 +1,17 @@
-#include <cheri/cheric.h>
-#include <sys/caprevoke.h>
-#include <sys/types.h>
-#include <sys/mman.h>
-#include <sys/tree.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <cheri/cheric.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/tree.h>
+#include <sys/caprevoke.h>
+/*#include <caprevoke.h>*/
 
+#include "caprevoke.h"
 #include "mrs.h"
 
 // use mrs on a cheri-enabled system to make a legacy memory allocator that has
@@ -252,15 +255,15 @@ void mrs_free(void *ptr) {
     params.real_free = dlsym(RTLD_NEXT, "free");
   }
 
-  struct mrs_alloc_desc *alloc = lookup_alloc_desc(ptr);
+  struct mrs_alloc_desc *alloc_desc = lookup_alloc_desc(ptr);
 
-  if (alloc == NULL) {
+  if (alloc_desc == NULL) {
     mrs_debug_printf("mrs_free: freed base address not allocated\n");
     exit(7);
   }
 
-  if (cheri_getlen(ptr)!= cheri_getlen(alloc->alloc)) {
-    mrs_debug_printf("mrs_free: freed base address size mismatch cap len 0x%zx alloc size 0x%zx\n", cheri_getlen(ptr), cheri_getlen(alloc->alloc));
+  if (cheri_getlen(ptr)!= cheri_getlen(alloc_desc->alloc)) {
+    mrs_debug_printf("mrs_free: freed base address size mismatch cap len 0x%zx alloc size 0x%zx\n", cheri_getlen(ptr), cheri_getlen(alloc_desc->alloc));
     exit(7);
   }
 
@@ -273,8 +276,19 @@ void mrs_free(void *ptr) {
    *
    */
 
-  params.real_free(ptr);
-  RB_REMOVE(mrs_alloc_desc_head, &params.allocations, alloc);
+  struct caprevoke_stats crst;
+  uint64_t oepoch;
+  caprev_shadow_nomap_set(alloc_desc->shadow_desc->shadow, ptr);
+
+  /*caprevoke(CAPREVOKE_JUST_THE_TIME, 0, &crst);*/
+  /*oepoch = crst.epoch;*/
+  /*caprevoke(CAPREVOKE_LAST_PASS, oepoch, &crst);*/
+
+  /*caprev_shadow_nomap_clear(alloc_desc->shadow_desc->shadow, ptr);*/
+
+  // XXX once revoker runs ptr's tag will be cleared - need to change mrs to a library consumed by allocators
+  /*params.real_free(ptr);*/
+  RB_REMOVE(mrs_alloc_desc_head, &params.allocations, alloc_desc);
 }
 
 // TODO realloc calloc posix_memalign etc
