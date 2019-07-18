@@ -9,9 +9,8 @@
 #include <sys/mman.h>
 #include <sys/tree.h>
 #include <sys/caprevoke.h>
-/*#include <caprevoke.h>*/
+#include <caprevoke.h>
 
-#include "caprevoke.h"
 #include "mrs.h"
 
 // use mrs on a cheri-enabled system to make a legacy memory allocator that has
@@ -30,21 +29,34 @@
 // underlying implementations are supplied by the linked memory allocator, and
 // where that underlying allocator is modified to use the mrs mmap function.
 
-void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
-  return mrs_mmap(addr, len, prot, flags, fd, offset);
-}
+// mrs can be built as a standalone shared library for use with LD_PRELOAD over
+// an existing allocator (#define STANDALONE) - in this case it exports malloc, free, and mmap
+// symbols, and it gets the "correct" or underlying ones from dlsym. mrs can
+// also be linked into an existing cherified malloc implmenetaion (#define
+// MALLOC_PREFIX example), in which case it exports only the malloc and free
+// symbols. the malloc implementation should be modified to use mrs_mmap
+// instead of mmap, and its malloc and free functions should be prefixed with
+// the name of the malloc. mrs will then use those prefixed functions (and the
+// real mmap) as the "correct" ones.
+
 void *malloc(size_t size) {
   return mrs_malloc(size);
 }
 void free(void *ptr) {
   return mrs_free(ptr);
 }
-
-static int insert_shadow_desc();
+#ifdef STANDALONE
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
+  return mrs_mmap(addr, len, prot, flags, fd, offset);
+}
+#endif
+// TODO 
+void *je_malloc(size_t size);
+void je_free(void *ptr);
 
 #define DEBUG 1
 
-// TODO fprintf might use malloc/mmap/free/etc
+// TODO fprintf might use malloc/free/mmap
 #define mrs_debug_printf(fmt, ...) \
   do {if (DEBUG) fprintf(stderr, ("mrs: " fmt), ##__VA_ARGS__); } while (0)
 
@@ -53,12 +65,33 @@ static int insert_shadow_desc();
 struct mrs_params {
   struct mrs_shadow_desc *shadow_spaces;
   RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
+  bool initialized;
   void* (*real_mmap) (void*, size_t, int, int, int, off_t);
   void* (*real_malloc) (size_t);
   void (*real_free) (void*);
 };
 
 static struct mrs_params params = {0};
+
+static inline void init_params() {
+  if (!params.initialized) {
+#if defined(STANDALONE)
+    // XXX dlsym might cause a malloc/free/mmap
+    params.real_malloc = dlsym(RTLD_NEXT, "malloc");
+    params.real_free = dlsym(RTLD_NEXT, "free");
+    params.real_mmap = dlsym(RTLD_NEXT, "mmap");
+#elif defined(MALLOC_PREFIX)
+#define concat_resolved(a, b) a ## b
+#define concat(a, b) concat_resolved(a,b) // need a function without ## so args will be resolved
+    params.real_malloc = concat(MALLOC_PREFIX, _malloc);
+    params.real_free = concat(MALLOC_PREFIX, _free);
+    params.real_mmap = mmap;
+#else
+#error must build mrs with either STANDALONE or MALLOC_PREFIX defined
+#endif
+    params.initialized = true;
+  }
+}
 
 // ---------------------------------- MMAP -> SHADOW SPACE MAPPING
 // TODO support removal and free list of descriptors, use better data
@@ -81,7 +114,7 @@ static struct mrs_shadow_desc shadow_descs[NUM_SHADOW_DESCS];
 
 static int insert_shadow_desc(void *mapped, void *shadow) {
   if (shadow_desc_index == NUM_SHADOW_DESCS) {
-    printf("insert_shadow_desc: maximum number of shadow_descs exceeded\n");
+    mrs_debug_printf("insert_shadow_desc: maximum number of shadow_descs exceeded\n");
     return -1;
   }
 
@@ -148,7 +181,7 @@ static struct mrs_alloc_desc alloc_descs[NUM_ALLOC_DESCS];
 
 static int insert_alloc_desc(void *alloc, struct mrs_shadow_desc *shadow_desc) {
   if (alloc_desc_index == NUM_ALLOC_DESCS) {
-    printf("insert_alloc_desc: maximum number of alloc_descs exceeded\n");
+    mrs_debug_printf("insert_alloc_desc: maximum number of alloc_descs exceeded\n");
     return -1;
   }
 
@@ -158,7 +191,7 @@ static int insert_alloc_desc(void *alloc, struct mrs_shadow_desc *shadow_desc) {
   ins->shadow_desc = shadow_desc;
 
   if (RB_INSERT(mrs_alloc_desc_head, &params.allocations, ins)) {
-    printf("insert_alloc_desc: duplicate insert\n");
+    mrs_debug_printf("insert_alloc_desc: duplicate insert\n");
     return -1;
   }
 
@@ -176,10 +209,7 @@ static struct mrs_alloc_desc *lookup_alloc_desc(void *alloc) {
 void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
   mrs_debug_printf("mrs_mmap: called with addr %p len 0x%zx prot 0x%x flags 0x%x fd %d offset 0x%zx\n", addr, len, prot, flags, fd, offset);
 
-  if (params.real_mmap == NULL) {
-    // TODO dlsym might use mmap
-    params.real_mmap = dlsym(RTLD_NEXT, "mmap");
-  }
+  init_params();
 
   void *mb = params.real_mmap(addr, len, prot, flags, fd, offset);
   if (mb ==  MAP_FAILED) {
@@ -207,14 +237,7 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
 
 void *mrs_malloc(size_t size) {
 
-  if (params.real_malloc == NULL) {
-    // TODO dlsym might use malloc
-    params.real_malloc = dlsym(RTLD_NEXT, "malloc");
-  }
-  if (params.real_free == NULL) {
-    // TODO dlsym might use free
-    params.real_free = dlsym(RTLD_NEXT, "free");
-  }
+  init_params();
 
   void *alloc = params.real_malloc(size);
 
@@ -250,10 +273,7 @@ void mrs_free(void *ptr) {
     return;
   }
 
-  if (params.real_free == NULL) {
-    // TODO dlsym might use free
-    params.real_free = dlsym(RTLD_NEXT, "free");
-  }
+  init_params();
 
   struct mrs_alloc_desc *alloc_desc = lookup_alloc_desc(ptr);
 
@@ -280,14 +300,14 @@ void mrs_free(void *ptr) {
   uint64_t oepoch;
   caprev_shadow_nomap_set(alloc_desc->shadow_desc->shadow, ptr);
 
-  /*caprevoke(CAPREVOKE_JUST_THE_TIME, 0, &crst);*/
-  /*oepoch = crst.epoch;*/
-  /*caprevoke(CAPREVOKE_LAST_PASS, oepoch, &crst);*/
+  caprevoke(CAPREVOKE_JUST_THE_TIME, 0, &crst);
+  oepoch = crst.epoch;
+  caprevoke(CAPREVOKE_LAST_PASS, oepoch, &crst);
 
-  /*caprev_shadow_nomap_clear(alloc_desc->shadow_desc->shadow, ptr);*/
+  caprev_shadow_nomap_clear(alloc_desc->shadow_desc->shadow, ptr);
 
-  // XXX once revoker runs ptr's tag will be cleared - need to change mrs to a library consumed by allocators
-  /*params.real_free(ptr);*/
+  // XXX once revoker runs ptr's tag will be cleared
+  params.real_free(ptr);
   RB_REMOVE(mrs_alloc_desc_head, &params.allocations, alloc_desc);
 }
 

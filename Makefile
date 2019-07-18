@@ -1,33 +1,42 @@
-PURECAP=-mabi=purecap
-CC=/home/bg357/cheri/output/sdk/bin/cheri-unknown-freebsd-clang --sysroot=/home/bg357/cheri/output/rootfs-purecap128 -B/home/bg357/cheri/output/sdk -msoft-float $(PURECAP)
+OBJDIR=objects
+
+CC=/home/bg357/cheri/output/sdk/bin/cheri-unknown-freebsd-clang --sysroot=/home/bg357/cheri/output/rootfs-purecap128 -B/home/bg357/cheri/output/sdk -msoft-float -mabi=purecap
 
 CFLAGS=-Wall -Werror
-CFLAGS+=-O0
+#CFLAGS+=-O0
 CFLAGS+=-std=c11
-CFLAGS+=-c
-CFLAGS+=-g
-CFLAGS+=-Wno-error=unused-function
-CFLAGS+=-Wno-error=unused-variable
-CFLAGS+=-Wno-error=unused-label
+#CFLAGS+=-g
+#CFLAGS+=-Wno-error=unused-function
+#CFLAGS+=-Wno-error=unused-variable
+#CFLAGS+=-Wno-error=unused-label
 
-#LFLAGS=-lcheri_caprevoke
+all: libmrs.so libjemalloc.so
 
-all: libmrs.so test
+# standalone 
 
-mrs.o: mrs.c
-	$(CC) $(CFLAGS) -fPIC mrs.c -o mrs.o
+$(OBJDIR)/mrs-standalone.o: mrs.c
+	$(CC) $(CFLAGS) -c -fPIC -DSTANDALONE mrs.c -o $(OBJDIR)/mrs-standalone.o
 
-caprevoke.o: caprevoke.c
-	$(CC) $(CFLAGS) -fPIC caprevoke.c -o caprevoke.o
+libmrs.so: $(OBJDIR)/mrs-standalone.o
+	$(CC) -shared -lcheri_caprevoke $(OBJDIR)/mrs-standalone.o -o libmrs.so
 
-libmrs.so: mrs.o caprevoke.o
-	$(CC) -shared $(LFLAGS) mrs.o caprevoke.o -o libmrs.so
+# jemalloc
+#
+$(OBJDIR)/mrs-jemalloc.o: mrs.c
+	$(CC) $(CFLAGS) -c -fPIC -DMALLOC_PREFIX=je mrs.c -o $(OBJDIR)/mrs-jemalloc.o
 
-test.o: test.c
-	$(CC) $(CFLAGS) test.c -o test.o
+JEMSRCS=jemalloc.c arena.c background_thread.c base.c bin.c bitmap.c \
+ckh.c ctl.c div.c extent.c extent_dss.c extent_mmap.c hash.c hooks.c \
+large.c log.c malloc_io.c mutex.c mutex_pool.c nstime.c pages.c \
+prng.c prof.c rtree.c stats.c sz.c tcache.c ticker.c tsd.c witness.c
 
-test: test.o libmrs.so
-	$(CC) test.o -L. -lmrs -o test
+JEMOBJPATHS=$(JEMSRCS:%.c=$(OBJDIR)/%.o)
+
+$(JEMOBJPATHS): $(OBJDIR)/%.o : jemalloc/src/%.c
+	$(CC) $(CFLAGS) -Ijemalloc/include -I. -DJEMALLOC_NO_RENAME -c -fPIC $< -o $@
+
+libjemalloc.so : $(JEMOBJPATHS) $(OBJDIR)/mrs-jemalloc.o
+	$(CC) -shared -lcheri_caprevoke $(OBJDIR)/mrs-jemalloc.o $(JEMOBJPATHS) -o libjemalloc.so
 
 clean:
-	rm -rf mrs.o caprevoke.o test.o libmrs.so test
+	rm -rf libmrs.so libjemalloc.so objects/*
