@@ -54,6 +54,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
 void *je_malloc(size_t size);
 void je_free(void *ptr);
 
+#define QUARANTINE_HIGHWATER (1024L * 2)
+
 #define DEBUG 1
 
 // TODO fprintf might use malloc/free/mmap
@@ -65,6 +67,8 @@ void je_free(void *ptr);
 struct mrs_params {
   struct mrs_shadow_desc *shadow_spaces;
   RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
+  struct mrs_alloc_desc *quarantine;
+  long quarantine_size;
   bool initialized;
   void* (*real_mmap) (void*, size_t, int, int, int, off_t);
   void* (*real_malloc) (size_t);
@@ -165,6 +169,7 @@ static void *lookup_shadow_desc(void *alloc) {
 struct mrs_alloc_desc {
   void *alloc;
   struct mrs_shadow_desc *shadow_desc;
+  struct mrs_alloc_desc *qnext;
   RB_ENTRY(mrs_alloc_desc) linkage;
 };
 
@@ -228,7 +233,7 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
     return MAP_FAILED;
   }
 
-  mrs_debug_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mb, sh);
+  /*mrs_debug_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mb, sh);*/
 
   return mb;
 }
@@ -296,19 +301,36 @@ void mrs_free(void *ptr) {
    *
    */
 
-  struct caprevoke_stats crst;
-  uint64_t oepoch;
-  caprev_shadow_nomap_set(alloc_desc->shadow_desc->shadow, ptr);
+  alloc_desc->qnext = params.quarantine;
+  params.quarantine = alloc_desc;
+  params.quarantine_size += cheri_getlen(alloc_desc->alloc);
 
-  caprevoke(CAPREVOKE_JUST_THE_TIME, 0, &crst);
-  oepoch = crst.epoch;
-  caprevoke(CAPREVOKE_LAST_PASS, oepoch, &crst);
+  if (params.quarantine_size >= QUARANTINE_HIGHWATER) {
+    mrs_debug_printf("mrs_free: passed quarantine highwater of %lu, revoking\n", QUARANTINE_HIGHWATER);
+    struct mrs_alloc_desc *iter = params.quarantine;
+    while (iter != NULL) {
+      caprev_shadow_nomap_set(iter->shadow_desc->shadow, iter->alloc);
+      iter = iter->qnext;
+    }
 
-  caprev_shadow_nomap_clear(alloc_desc->shadow_desc->shadow, ptr);
+    struct caprevoke_stats crst;
+    uint64_t oepoch;
+    caprevoke(CAPREVOKE_JUST_THE_TIME, 0, &crst);
+    oepoch = crst.epoch;
+    caprevoke(CAPREVOKE_LAST_PASS, oepoch, &crst);
 
-  // XXX once revoker runs ptr's tag will be cleared
-  params.real_free(ptr);
-  RB_REMOVE(mrs_alloc_desc_head, &params.allocations, alloc_desc);
+    iter = params.quarantine;
+    while (iter != NULL) {
+      caprev_shadow_nomap_clear(iter->shadow_desc->shadow, iter->alloc);
+      // XXX once revoker runs the tag will be cleared
+      params.real_free(iter->alloc);
+      RB_REMOVE(mrs_alloc_desc_head, &params.allocations, iter);
+      iter = iter->qnext;
+    }
+
+    params.quarantine = NULL;
+    params.quarantine_size = 0;
+  }
 }
 
 // TODO realloc calloc posix_memalign etc

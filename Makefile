@@ -10,9 +10,9 @@ CFLAGS+=-std=c11
 #CFLAGS+=-Wno-error=unused-variable
 #CFLAGS+=-Wno-error=unused-label
 
-all: libmrs.so libjemalloc.so
+all: libmrs.so libjemalloc.so mrstest
 
-# standalone 
+# standalone
 
 $(OBJDIR)/mrs-standalone.o: mrs.c
 	$(CC) $(CFLAGS) -c -fPIC -DSTANDALONE mrs.c -o $(OBJDIR)/mrs-standalone.o
@@ -21,7 +21,7 @@ libmrs.so: $(OBJDIR)/mrs-standalone.o
 	$(CC) -shared -lcheri_caprevoke $(OBJDIR)/mrs-standalone.o -o libmrs.so
 
 # jemalloc
-#
+
 $(OBJDIR)/mrs-jemalloc.o: mrs.c
 	$(CC) $(CFLAGS) -c -fPIC -DMALLOC_PREFIX=je mrs.c -o $(OBJDIR)/mrs-jemalloc.o
 
@@ -38,5 +38,9 @@ $(JEMOBJPATHS): $(OBJDIR)/%.o : jemalloc/src/%.c
 libjemalloc.so : $(JEMOBJPATHS) $(OBJDIR)/mrs-jemalloc.o
 	$(CC) -shared -lcheri_caprevoke $(OBJDIR)/mrs-jemalloc.o $(JEMOBJPATHS) -o libjemalloc.so
 
+# test
+mrstest: test/test.c
+	$(CC) $(CFLAGS) test/test.c -o mrstest
+
 clean:
-	rm -rf libmrs.so libjemalloc.so objects/*
+	rm -rf libmrs.so libjemalloc.so mrstest objects/*
