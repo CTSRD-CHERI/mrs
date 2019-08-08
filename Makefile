@@ -5,20 +5,26 @@ CC=/home/bg357/cheri/output/sdk/bin/cheri-unknown-freebsd-clang --sysroot=/home/
 CFLAGS=-Wall -Werror
 #CFLAGS+=-O0
 CFLAGS+=-std=c11
-#CFLAGS+=-g
-#CFLAGS+=-Wno-error=unused-function
+CFLAGS+=-v
+CFLAGS+=-g
+CFLAGS+=-Wno-error=unused-function
 #CFLAGS+=-Wno-error=unused-variable
 #CFLAGS+=-Wno-error=unused-label
 
 all: libmrs.so libjemalloc.so mrstest
+
+# printf
+
+$(OBJDIR)/printf.o: printf.c
+	$(CC) $(CFLAGS) -c -fPIC printf.c -o $(OBJDIR)/printf.o
 
 # standalone
 
 $(OBJDIR)/mrs-standalone.o: mrs.c
 	$(CC) $(CFLAGS) -c -fPIC -DSTANDALONE mrs.c -o $(OBJDIR)/mrs-standalone.o
 
-libmrs.so: $(OBJDIR)/mrs-standalone.o
-	$(CC) -shared -lcheri_caprevoke $(OBJDIR)/mrs-standalone.o -o libmrs.so
+libmrs.so: $(OBJDIR)/mrs-standalone.o $(OBJDIR)/printf.o
+	$(CC) -shared -lpthread -lcheri_caprevoke $(OBJDIR)/mrs-standalone.o $(OBJDIR)/printf.o -o libmrs.so
 
 # jemalloc
 
@@ -35,10 +41,11 @@ JEMOBJPATHS=$(JEMSRCS:%.c=$(OBJDIR)/%.o)
 $(JEMOBJPATHS): $(OBJDIR)/%.o : jemalloc/src/%.c
 	$(CC) $(CFLAGS) -Ijemalloc/include -I. -DJEMALLOC_NO_RENAME -c -fPIC $< -o $@
 
-libjemalloc.so : $(JEMOBJPATHS) $(OBJDIR)/mrs-jemalloc.o
-	$(CC) -shared -lcheri_caprevoke $(OBJDIR)/mrs-jemalloc.o $(JEMOBJPATHS) -o libjemalloc.so
+libjemalloc.so : $(JEMOBJPATHS) $(OBJDIR)/mrs-jemalloc.o $(OBJDIR)/printf.o
+	$(CC) -shared -pthread -lcheri_caprevoke $(OBJDIR)/mrs-jemalloc.o $(JEMOBJPATHS) $(OBJDIR)/printf.o -o libjemalloc.so
 
 # test
+
 mrstest: test/test.c
 	$(CC) $(CFLAGS) test/test.c -o mrstest
 
