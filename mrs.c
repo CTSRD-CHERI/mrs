@@ -11,7 +11,9 @@
 #include <sys/caprevoke.h>
 #include <cheri/caprevoke.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
+#include "printf.h"
 #include "mrs.h"
 
 // use mrs on a cheri-enabled system to make a legacy memory allocator that has
@@ -55,7 +57,7 @@
  * memory for metadata, and protection against double-free and arbitrary free
  * attacks (an allocated region, identified by the base of the capability that
  * points to it, can only be freed once; non-allocated regions cannot be
- * freed).
+ * freed). Also protects against duplicate allocations.
  *
  * Additional sanitization is validating the size of capabilities passed to
  * free, TODO validating that pages will not be munmapped or madvise free'd
@@ -63,6 +65,8 @@
  * regions do not contain any capabilities (are zeroed before allocation),
  * validating the size and permissions of capabilities returned by the memory
  * allocator, determining at exit the number of outstanding alocations, ...
+ *
+ * TODO add a mode where failing a guarantee stops execution.
  */
 
 #define concat_resolved(a, b) a ## b
@@ -116,7 +120,9 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
 struct mrs_shadow_desc {
   void *mmap_region;
   void *shadow;
+#ifdef SANITIZE
   int allocations; // TODO count number of corresponding allocs to validate munmap
+#endif /* SANITIZE */
   struct mrs_shadow_desc *next;
 };
 
@@ -130,10 +136,12 @@ struct mrs_alloc_desc {
 };
 
 struct mrs_shadow_desc shadow_descs[NUM_SHADOW_DESCS];
+atomic_int shadow_descs_index;
 struct mrs_shadow_desc *shadow_spaces;
 struct mrs_shadow_desc *free_shadow_descs;
 
 struct mrs_alloc_desc alloc_descs[NUM_ALLOC_DESCS];
+atomic_int alloc_descs_index;
 RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
 struct mrs_alloc_desc *free_alloc_descs;
 
@@ -180,12 +188,11 @@ create_lock(quarantine_lock);
 
 /* printf debugging */
 
-#ifdef DEBUG
-
-#include "printf.h"
 void _putchar(char character) {
   write(2, &character, sizeof(char));
 }
+
+#ifdef DEBUG
 
 #define mrs_debug_printf(fmt, ...) \
   do {mrs_lock(&debug_lock); printf(("mrs: " fmt), ##__VA_ARGS__); mrs_unlock(&debug_lock);} while (0)
@@ -199,8 +206,6 @@ void _putchar(char character) {
 #define mrs_debug_printcap(name, cap)
 
 #endif /* !DEBUG */
-
-// TODO multicore add lock, fix this if check, don't enable this by default
 
 /* shadow_desc utilities */
 
@@ -270,21 +275,35 @@ static void *lookup_shadow_desc(void *alloc) {
 
 /* alloc_desc utilities */
 
-void alloc_desc_list_insert(struct mrs_alloc_desc **list, struct mrs_alloc_desc *elem) {
-  if (list == NULL || elem == NULL) {
-    return;
-  }
-  elem->next = *list;
-  *list = elem;
-}
+/* there is no free_alloc_desc because descriptors are batch-freed when the quarantine is flushed */
+struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shadow_desc *shadow_desc) {
+  struct mrs_alloc_desc *ret;
 
-struct mrs_alloc_desc *alloc_desc_list_remove(struct mrs_alloc_desc **list) {
-  if (list == NULL || *list == NULL) {
+  /* allocate from store until it is empty, then use free list */
+  if (alloc_descs_index < NUM_ALLOC_DESCS) {
+    int idx = atomic_fetch_add_explicit(&alloc_descs_index, 1, memory_order_relaxed);
+    if (idx < NUM_ALLOC_DESCS) {
+      ret = &alloc_descs[idx];
+      ret->allocated_region = allocated_region;
+      ret->shadow = shadow_desc->shadow;
+      ret->shadow_desc = shadow_desc;
+      return ret;
+    }
+  }
+
+  mrs_lock(&free_alloc_descs_lock);
+  if (free_alloc_descs != NULL) {
+    ret = free_alloc_descs;
+    free_alloc_descs = free_alloc_descs->next;
+  } else {
+    mrs_unlock(&free_alloc_descs_lock);
     return NULL;
   }
-  struct mrs_alloc_desc *ret = *list;
-  *list = (*list)->next;
-  ret->next = NULL;
+  mrs_unlock(&free_alloc_descs_lock);
+
+  ret->allocated_region = allocated_region;
+  ret->shadow = shadow_desc->shadow;
+  ret->shadow_desc = shadow_desc;
   return ret;
 }
 
@@ -295,33 +314,12 @@ static vaddr_t mrs_alloc_desc_cmp(struct mrs_alloc_desc *e1, struct mrs_alloc_de
 RB_PROTOTYPE(mrs_alloc_desc_head, mrs_alloc_desc, linkage, mrs_alloc_desc_cmp);
 RB_GENERATE(mrs_alloc_desc_head, mrs_alloc_desc, linkage, mrs_alloc_desc_cmp);
 
-static int insert_alloc_desc(void *alloc, struct mrs_shadow_desc *shadow_desc) {
-  struct mrs_alloc_desc *ins = alloc_desc_list_remove(&free_alloc_descs);
-  if (ins == NULL) {
-    mrs_debug_printf("insert_alloc_desc: maximum number of alloc_descs exceeded\n");
-    return -1;
-  }
-  ins->allocated_region = alloc;
-  ins->shadow_desc = shadow_desc;
-
-  if (RB_INSERT(mrs_alloc_desc_head, &allocations, ins)) {
-    mrs_debug_printf("insert_alloc_desc: duplicate insert\n");
-    return -1;
-  }
-
-  return 0;
+static struct mrs_alloc_desc *add_alloc_desc(struct mrs_alloc_desc *add) {
+  return RB_INSERT(mrs_alloc_desc_head, &allocations, add);
 }
 
-static int remove_alloc_desc(struct mrs_alloc_desc *rem) {
-  struct mrs_alloc_desc *ret = RB_REMOVE(mrs_alloc_desc_head, &allocations, rem);
-  if (ret == NULL) {
-    mrs_debug_printf("remove_alloc_desc: element not found\n");
-    return -1;
-  }
-  ret->allocated_region = NULL;
-  ret->shadow_desc = NULL;
-  alloc_desc_list_insert(&free_alloc_descs, ret);
-  return 0;
+static struct mrs_alloc_desc *remove_alloc_desc(struct mrs_alloc_desc *rem) {
+  return RB_REMOVE(mrs_alloc_desc_head, &allocations, rem);
 }
 
 static struct mrs_alloc_desc *lookup_alloc_desc(void *alloc) {
@@ -371,9 +369,9 @@ initialize_lock(quarantine_lock);
   for (int i = 0; i < NUM_SHADOW_DESCS; i++) {
     shadow_desc_list_insert(&free_shadow_descs, &shadow_descs[i]);
   }
-  for (int i = 0; i < NUM_ALLOC_DESCS; i++) {
-    alloc_desc_list_insert(&free_alloc_descs, &alloc_descs[i]);
-  }
+  /*for (int i = 0; i < NUM_ALLOC_DESCS; i++) {*/
+    /*alloc_desc_list_insert(&free_alloc_descs, &alloc_descs[i]);*/
+  /*}*/
 
   mrs_debug_printf("init: complete\n");
 }
@@ -413,43 +411,54 @@ void *mrs_malloc(size_t size) {
 
   /*mrs_debug_printf("mrs_malloc: enter\n");*/
 
-  void *alloc = real_malloc(size);
+  void *allocated_region = real_malloc(size);
 
+  /*
+   * find the shadow space corresponding to the allocated region
+   * and create a descriptor for it.
+   */
   mrs_lock(&shadow_spaces_lock);
-  void *sh = lookup_shadow_desc(alloc);
-  if (sh == NULL) {
+  void *shadow_desc = lookup_shadow_desc(allocated_region);
+  if (shadow_desc == NULL) {
     mrs_unlock(&shadow_spaces_lock);
-    mrs_debug_printf("\nmrs_malloc: looking up shadow space failed\n");
-    real_free(alloc);
+    mrs_debug_printf("mrs_malloc: looking up shadow space failed\n");
+    real_free(allocated_region);
     return NULL;
   }
 
-  mrs_lock(&allocations_lock);
-  if (insert_alloc_desc(alloc, sh)) {
-    mrs_unlock(&allocations_lock);
+  struct mrs_alloc_desc *ins = alloc_alloc_desc(allocated_region, shadow_desc);
+  if (ins == NULL) {
     mrs_unlock(&shadow_spaces_lock);
-    mrs_debug_printf("\nmrs_malloc: inserting alloc descriptor failed\n");
-    real_free(alloc);
+    mrs_debug_printf("mrs_malloc: ran out of allocation descriptors\n");
+    real_free(allocated_region);
+    return NULL;
+  }
+
+#ifdef SANITIZE
+  shadow_desc->allocations++;
+#endif /* SANITIZE */
+  mrs_unlock(&shadow_spaces_lock);
+
+  /* add the descriptor to our red-black tree */
+  mrs_lock(&allocations_lock);
+  if (add_alloc_desc(ins)) {
+    mrs_unlock(&allocations_lock);
+    mrs_debug_printf("mrs_malloc: duplicate allocation\n");
+    real_free(allocated_region);
     return NULL;
   }
   mrs_unlock(&allocations_lock);
-  mrs_unlock(&shadow_spaces_lock);
 
-  mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, alloc);
+  mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, allocated_region);
 
-  return alloc;
+  return allocated_region;
 }
 
 void *mrs_flush_quarantine(void *local_quarantine) {
   struct mrs_alloc_desc *iter = (struct mrs_alloc_desc *)local_quarantine;
   while (iter != NULL) {
-    // TODO need lock for shadow space one since we access it. may want to do counts,
-    // or if we never give back shadow space just store that cap in the allocation descriptor.
-    // TODO use raw version when available
-    mrs_lock(&shadow_spaces_lock); //TODO this design doesn't make sense perf-wise. keep a local copy of shadow cap, only do the lock in sanitize mode
-                                  // when the alloc is actually removed and freed. Same thing for clearing below.
-    caprev_shadow_nomap_set(iter->shadow_desc->shadow, iter->allocated_region, iter->allocated_region);
-    mrs_unlock(&shadow_spaces_lock);
+    // TODO use raw version when available? no we are multicore
+    caprev_shadow_nomap_set(iter->shadow, iter->allocated_region, iter->allocated_region);
     iter = iter->next;
   }
 
@@ -463,17 +472,19 @@ void *mrs_flush_quarantine(void *local_quarantine) {
   struct mrs_alloc_desc *prev;
   iter = (struct mrs_alloc_desc *)local_quarantine;
   while (iter != NULL) {
-    mrs_lock(&shadow_spaces_lock);
-    caprev_shadow_nomap_clear(iter->shadow_desc->shadow, iter->allocated_region);
-    mrs_unlock(&shadow_spaces_lock);
-    // XXX once revoker runs the tag will be cleared
+    caprev_shadow_nomap_clear(iter->shadow, iter->allocated_region);
+    // XXX once the revoker runs the tag will be cleared, allocator has to accept this
     real_free(iter->allocated_region);
-    // TODO in sanitize mode decrement the mmaped page's count.
+#ifdef SANITIZE
+    mrs_lock(&shadow_spaces_lock);
+    iter->shadow_desc->allocations--;
+    mrs_unlock(&shadow_spaces_lock);
+#endif /* SANITIZE */
     prev = iter;
     iter = iter->next;
   }
 
-  // quarantine to free list
+  /* free the quarantined descriptors */
   mrs_lock(&free_alloc_descs_lock);
   prev->next = free_alloc_descs;
   free_alloc_descs = (struct mrs_alloc_desc *)local_quarantine;
@@ -483,7 +494,8 @@ void *mrs_flush_quarantine(void *local_quarantine) {
 }
 
 /* TODO if a full page is freed, we may want to do munmap or mprotect (or
- * special MPROT_QUARANTINE later). we may also want to coalesce in quarantine
+ * special MPROT_QUARANTINE later). can we get away with this, what will the
+ * allocator expect? we may also want to coalesce in quarantine
  * and measure the quarantine size by number of physical pages occupied .*/
 /* TODO atexit how many things are not freed? */
 void mrs_free(void *ptr) {
@@ -494,28 +506,35 @@ void mrs_free(void *ptr) {
     return;
   }
 
+  /* find, validate, and remove the allocation descriptor */
   mrs_lock(&allocations_lock);
   struct mrs_alloc_desc *alloc_desc = lookup_alloc_desc(ptr);
-
   if (alloc_desc == NULL) {
     mrs_debug_printf("mrs_free: freed base address not allocated\n");
     mrs_unlock(&allocations_lock);
-    exit(7); // XXX
+    return;
   }
 
 #ifdef SANITIZE
   if (cheri_getlen(ptr)!= cheri_getlen(alloc_desc->allocated_region)) {
     mrs_debug_printf("mrs_free: freed base address size mismatch cap len 0x%zx alloc size 0x%zx\n", cheri_getlen(ptr), cheri_getlen(alloc_desc->allocated_region));
     mrs_unlock(&allocations_lock);
-    exit(7); // XXX
+    return;
   }
 #endif /* SANITIZE */
 
-  RB_REMOVE(mrs_alloc_desc_head, &allocations, alloc_desc); // TODO error check?
+  RB_REMOVE(mrs_alloc_desc_head, &allocations, alloc_desc);
+  if (remove_alloc_desc(alloc_desc) == NULL) {
+    mrs_debug_printf("mrs_free: could not remove alloc descriptor\n");
+    mrs_unlock(&allocations_lock);
+    return;
+  }
   mrs_unlock(&allocations_lock);
 
+  /* add the allocation descriptor to quarantine */
   mrs_lock(&quarantine_lock);
-  alloc_desc_list_insert(&quarantine, alloc_desc);
+  alloc_desc->next = quarantine;
+  quarantine = alloc_desc;
   quarantine_size += cheri_getlen(alloc_desc->allocated_region);
 
   if (quarantine_size >= QUARANTINE_HIGHWATER) {
