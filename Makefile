@@ -23,13 +23,13 @@ $(OBJDIR)/printf.o: printf.c
 $(OBJDIR)/mrs-standalone.o: mrs.c
 	$(CC) $(CFLAGS) -c -fPIC -DSTANDALONE mrs.c -o $(OBJDIR)/mrs-standalone.o
 
-libmrs.so: $(OBJDIR)/mrs-standalone.o $(OBJDIR)/printf.o
-	$(CC) -shared -lpthread -lcheri_caprevoke $(OBJDIR)/mrs-standalone.o $(OBJDIR)/printf.o -o libmrs.so
+#libmrs.so: $(OBJDIR)/mrs-standalone.o $(OBJDIR)/printf.o
+	#$(CC) -shared -lpthread -lcheri_caprevoke $(OBJDIR)/mrs-standalone.o $(OBJDIR)/printf.o -o libmrs.so
 
 # jemalloc
 
 $(OBJDIR)/mrs-jemalloc.o: mrs.c
-	$(CC) $(CFLAGS) -c -fPIC -DMALLOC_PREFIX=je -DDEBUG -DCONCURRENT -DOFFLOAD_QUARANTINE -DQUARANTINE_HIGHWATER=0 -DNUM_ALLOC_DESCS=1000 -DNUM_SHADOW_DESCS=1000 mrs.c -o $(OBJDIR)/mrs-jemalloc.o
+	$(CC) $(CFLAGS) -c -fPIC -DMALLOC_PREFIX=je -DDEBUG -DOFFLOAD_QUARANTINE -DQUARANTINE_HIGHWATER=0 -DNUM_ALLOC_DESCS=1000 -DNUM_SHADOW_DESCS=1000 mrs.c -o $(OBJDIR)/mrs-jemalloc.o
 
 JEMSRCS=jemalloc.c arena.c background_thread.c base.c bin.c bitmap.c \
 ckh.c ctl.c div.c extent.c extent_dss.c extent_mmap.c hash.c hooks.c \
