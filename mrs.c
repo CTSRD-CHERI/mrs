@@ -475,19 +475,37 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
     mrs_unlock(&shadow_spaces_lock);
     real_munmap(mmap_region, cheri_getlen(mmap_region));
     mrs_printf("mrs_mmap: error inserting shadow descriptor\n");
+    mrs_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mmap_region, shadow);
     return MAP_FAILED;
   }
   mrs_unlock(&shadow_spaces_lock);
 
-  /*mrs_debug_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mb, sh);*/
+  mrs_debug_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mmap_region, shadow);
   return mmap_region;
 }
 
-/* TODO write these */
 int mrs_munmap(void *addr, size_t len) {
   mrs_debug_printf("mrs_munmap: called\n");
+
+  mrs_lock(&shadow_spaces_lock);
+  struct mrs_shadow_desc *rem = lookup_shadow_desc_by_mmap(addr);
+  if (rem == NULL) {
+    mrs_unlock(&shadow_spaces_lock);
+    mrs_printf("mrs_munmap: shadow space descriptor not present\n");
+    return -1;
+  }
+
+  if (remove_shadow_desc(rem) == NULL) {
+    mrs_unlock(&shadow_spaces_lock);
+    mrs_printf("mrs_munmap: error removing shadow space descriptor\n");
+    return -1;
+  }
+  mrs_unlock(&shadow_spaces_lock);
+
   return real_munmap(addr, len);
 }
+
+/* TODO write these */
 int mrs_madvise(void *addr, size_t len, int behav) {
   mrs_debug_printf("mrs_madvise: called\n");
   return real_madvise(addr, len, behav);
