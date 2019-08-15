@@ -65,8 +65,6 @@
  *
  * MALLOC_PREFIX: build mrs linked into an existing malloc whose functions are prefixed with MALLOC_PREFIX
  * QUARANTINE_HIGHWATER: the quarantine size in bytes at which to carry out revocation (default 2MB) TODO percentage based
- * NUM_SHADOW_DESCS: number of descriptors for shadow space capabilities (default 10_000)
- * NUM_ALLOC_DESCS: number of descriptors for outstanding allocations (default 1_000_000)
  *
  * TODO knobs for ablation study
  * TODO knob for halting on property violation rather than continuing
@@ -99,14 +97,6 @@
 #ifndef QUARANTINE_HIGHWATER
 #define QUARANTINE_HIGHWATER (1024L * 1024 * 2)
 #endif /* !QUARANTINE_HIGHWATER */
-
-#ifndef NUM_SHADOW_DESCS
-#define NUM_SHADOW_DESCS 10000
-#endif /* !NUM_SHADOW_DESCS */
-
-#ifndef NUM_ALLOC_DESCS
-#define NUM_ALLOC_DESCS 1000000
-#endif /* !NUM_ALLOC_DESCS */
 
 /* function declarations and definitions */
 
@@ -186,18 +176,16 @@ static size_t psize;
 /* alignment requirement for allocations so they can be painted in the caprevoke bitmap */
 static const size_t CAPREVOKE_BITMAP_ALIGNMENT = 16;
 
-static struct mrs_shadow_desc shadow_descs[NUM_SHADOW_DESCS];
-static atomic_int shadow_descs_index;
+static const size_t NEW_DESCRIPTOR_BATCH_SIZE = 10000;
+
 static RB_HEAD(mrs_shadow_desc_head, mrs_shadow_desc) shadow_spaces;
 static struct mrs_shadow_desc *free_shadow_descs;
 
-static struct mrs_alloc_desc alloc_descs[NUM_ALLOC_DESCS];
-static atomic_int alloc_descs_index;
 static RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
 static struct mrs_alloc_desc *free_alloc_descs;
 
 static struct mrs_alloc_desc *quarantine;
-static long quarantine_size;
+static size_t quarantine_size;
 static struct mrs_alloc_desc *full_quarantine;
 
 static void *(*real_malloc) (size_t);
@@ -270,16 +258,6 @@ void _putchar(char character) {
 
 struct mrs_shadow_desc *alloc_shadow_desc(void *mmap_region, void *shadow) {
   struct mrs_shadow_desc *ret;
-
-  /* allocate from store until it is empty, then use free list */
-  if (shadow_descs_index < NUM_SHADOW_DESCS) {
-    int idx = atomic_fetch_add_explicit(&shadow_descs_index, 1, memory_order_relaxed);
-    if (idx < NUM_SHADOW_DESCS) {
-      ret = &shadow_descs[idx];
-      goto prepare_ret;
-    }
-  }
-
   mrs_lock(&free_shadow_descs_lock);
   if (free_shadow_descs != NULL) {
     ret = free_shadow_descs;
@@ -287,10 +265,22 @@ struct mrs_shadow_desc *alloc_shadow_desc(void *mmap_region, void *shadow) {
     mrs_unlock(&free_shadow_descs_lock);
   } else {
     mrs_unlock(&free_shadow_descs_lock);
-    return NULL;
+
+    mrs_debug_printf("alloc_shadow_desc: mapping new memory\n");
+    struct mrs_shadow_desc *new_descs = (struct mrs_shadow_desc *)real_mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_shadow_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
+    if (new_descs == MAP_FAILED) {
+      return NULL;
+    }
+    for (int i = 0; i < NEW_DESCRIPTOR_BATCH_SIZE - 2; i++) {
+      new_descs[i].next = &new_descs[i + 1];
+    }
+    ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
+    mrs_lock(&free_shadow_descs_lock);
+    new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = free_shadow_descs;
+    free_shadow_descs = new_descs;
+    mrs_unlock(&free_shadow_descs_lock);
   }
 
-prepare_ret:
   ret->mmap_region = mmap_region;
   ret->shadow = shadow;
   return ret;
@@ -335,16 +325,6 @@ static struct mrs_shadow_desc *lookup_shadow_desc_by_allocation(void *allocated_
 
 struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shadow_desc *shadow_desc) {
   struct mrs_alloc_desc *ret;
-
-  /* allocate from store until it is empty, then use free list */
-  if (alloc_descs_index < NUM_ALLOC_DESCS) {
-    int idx = atomic_fetch_add_explicit(&alloc_descs_index, 1, memory_order_relaxed);
-    if (idx < NUM_ALLOC_DESCS) {
-      ret = &alloc_descs[idx];
-      goto prepare_ret;
-    }
-  }
-
   mrs_lock(&free_alloc_descs_lock);
   if (free_alloc_descs != NULL) {
     ret = free_alloc_descs;
@@ -352,10 +332,22 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shado
     mrs_unlock(&free_alloc_descs_lock);
   } else {
     mrs_unlock(&free_alloc_descs_lock);
-    return NULL;
+
+    mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
+    struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)real_mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
+    if (new_descs == MAP_FAILED) {
+      return NULL;
+    }
+    for (int i = 0; i < NEW_DESCRIPTOR_BATCH_SIZE - 2; i++) {
+      new_descs[i].next = &new_descs[i + 1];
+    }
+    ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
+    mrs_lock(&free_alloc_descs_lock);
+    new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = free_alloc_descs;
+    free_alloc_descs = new_descs;
+    mrs_unlock(&free_alloc_descs_lock);
   }
 
-prepare_ret:
   ret->allocated_region = allocated_region;
   /* derive cap to allocated_region with VMMAP set so it won't be revoked */
   void *offset = cheri_setoffset(shadow_desc->mmap_region, cheri_getbase(allocated_region) - cheri_getbase(shadow_desc->mmap_region));
