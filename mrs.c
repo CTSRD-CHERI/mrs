@@ -215,7 +215,7 @@ int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size
     return name ## _buf; \
   }
 
-create_lock(debug_lock);
+create_lock(printf_lock);
 create_lock(shadow_spaces_lock);
 create_lock(free_shadow_descs_lock);
 create_lock(allocations_lock);
@@ -239,13 +239,17 @@ void _putchar(char character) {
   write(2, &character, sizeof(char));
 }
 
+#define mrs_printf(fmt, ...) \
+  do {mrs_lock(&printf_lock); printf(("mrs: " fmt), ##__VA_ARGS__); mrs_unlock(&printf_lock);} while (0)
+
+
 #ifdef DEBUG
 
 #define mrs_debug_printf(fmt, ...) \
-  do {mrs_lock(&debug_lock); printf(("mrs: " fmt), ##__VA_ARGS__); mrs_unlock(&debug_lock);} while (0)
+  mrs_printf(fmt, ##__VA_ARGS__)
 
 #define mrs_debug_printcap(name, cap) \
-  mrs_debug_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
+  mrs_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
 
 #else /* DEBUG */
 
@@ -392,7 +396,7 @@ static void init(void) {
 #define initialize_lock(name) \
   _pthread_mutex_init_calloc_cb(&name, name ## _storage)
 
-initialize_lock(debug_lock);
+initialize_lock(printf_lock);
 initialize_lock(shadow_spaces_lock);
 initialize_lock(free_shadow_descs_lock);
 initialize_lock(allocations_lock);
@@ -430,14 +434,14 @@ initialize_lock(full_quarantine_lock);
   /* spawn offload thread XXX in purecap spwaning this thread in init() causes main() not to be called */
   pthread_t thd;
   if (pthread_create(&thd, NULL, full_quarantine_offload, NULL)) {
-    mrs_debug_printf("pthread error\n");
+    mrs_printf("pthread error\n");
     exit(7);
   }
 #endif /* OFFLOAD_QUARANTINE */
 
   psize = getpagesize();
   if ((psize & (psize - 1)) != 0) {
-    mrs_debug_printf("psize not power of 2\n");
+    mrs_printf("psize not power of 2\n");
     exit(7);
   }
 }
@@ -449,20 +453,20 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
 
   void *mmap_region = real_mmap(addr, len, prot, flags, fd, offset);
   if (mmap_region == MAP_FAILED) {
-    mrs_debug_printf("mrs_mmap: error in mmap errno %d\n", errno);
+    mrs_printf("mrs_mmap: error in mmap errno %d\n", errno);
     return MAP_FAILED;
   }
 
   void *shadow;
   if (caprevoke_shadow(CAPREVOKE_SHADOW_NOVMMAP, mmap_region, &shadow)) {
-    mrs_debug_printf("mrs_mmap: error in caprevoke_shadow errno %d\n", errno);
+    mrs_printf("mrs_mmap: error in caprevoke_shadow errno %d\n", errno);
     return MAP_FAILED;
   }
 
   struct mrs_shadow_desc *add = alloc_shadow_desc(mmap_region, shadow);
   if (add == NULL) {
     real_munmap(mmap_region, cheri_getlen(mmap_region));
-    mrs_debug_printf("mrs_mmap: error allocating shadow descriptor\n");
+    mrs_printf("mrs_mmap: error allocating shadow descriptor\n");
     return MAP_FAILED;
   }
 
@@ -470,7 +474,7 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
   if (add_shadow_desc(add)) {
     mrs_unlock(&shadow_spaces_lock);
     real_munmap(mmap_region, cheri_getlen(mmap_region));
-    mrs_debug_printf("mrs_mmap: error inserting shadow descriptor\n");
+    mrs_printf("mrs_mmap: error inserting shadow descriptor\n");
     return MAP_FAILED;
   }
   mrs_unlock(&shadow_spaces_lock);
@@ -503,7 +507,7 @@ static int insert_allocation(void *allocated_region) {
   void *shadow_desc = lookup_shadow_desc_by_allocation(allocated_region);
   if (shadow_desc == NULL) {
     mrs_unlock(&shadow_spaces_lock);
-    mrs_debug_printf("insert_allocation: looking up shadow space failed\n");
+    mrs_printf("insert_allocation: looking up shadow space failed\n");
     real_free(allocated_region);
     return 7;
   }
@@ -511,7 +515,7 @@ static int insert_allocation(void *allocated_region) {
   struct mrs_alloc_desc *ins = alloc_alloc_desc(allocated_region, shadow_desc);
   if (ins == NULL) {
     mrs_unlock(&shadow_spaces_lock);
-    mrs_debug_printf("insert_allocation: ran out of allocation descriptors\n");
+    mrs_printf("insert_allocation: ran out of allocation descriptors\n");
     real_free(allocated_region);
     return 7;
   }
@@ -525,7 +529,7 @@ static int insert_allocation(void *allocated_region) {
   mrs_lock(&allocations_lock);
   if (add_alloc_desc(ins)) {
     mrs_unlock(&allocations_lock);
-    mrs_debug_printf("insert_allocation: duplicate allocation\n");
+    mrs_printf("insert_allocation: duplicate allocation\n");
     real_free(allocated_region);
     return 7;
   }
@@ -548,7 +552,7 @@ void *mrs_malloc(size_t size) {
    * for bitmap painting by increasing the size.
    */
   if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
-    mrs_debug_printf("mrs_malloc: size under caprevoke alignment, increasing size\n");
+    mrs_printf("mrs_malloc: size under caprevoke alignment, increasing size\n");
     size = CAPREVOKE_BITMAP_ALIGNMENT;
   }
 #endif /* STANDALONE */
@@ -557,7 +561,7 @@ void *mrs_malloc(size_t size) {
 
 #ifdef MALLOC_PREFIX
   if ((cheri_getbase(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_debug_printf("mrs_malloc: caprevoke bitmap alignment violated\n");
+    mrs_printf("mrs_malloc: caprevoke bitmap alignment violated\n");
     exit(7);
   }
 #endif /* MALLOC_PREFIX */
@@ -624,14 +628,14 @@ static void *full_quarantine_offload(void *arg) {
     while (full_quarantine == NULL) {
       mrs_debug_printf("full_quarantine_offload: waiting for full_quarantine to be ready\n");
       if (pthread_cond_wait(&full_quarantine_ready, &full_quarantine_lock)) {
-        mrs_debug_printf("pthread error\n");
+        mrs_printf("pthread error\n");
         exit(7);
       }
     }
     mrs_debug_printf("full_quarantine_offload: full_quarantine ready\n");
     flush_full_quarantine();
     if (pthread_cond_signal(&full_quarantine_empty)) {
-        mrs_debug_printf("pthread error\n");
+        mrs_printf("pthread error\n");
         exit(7);
     }
     mrs_unlock(&full_quarantine_lock);
@@ -652,7 +656,7 @@ void mrs_free(void *ptr) {
   mrs_lock(&allocations_lock);
   struct mrs_alloc_desc *alloc_desc = lookup_alloc_desc(ptr);
   if (alloc_desc == NULL) {
-    mrs_debug_printf("mrs_free: freed base address not allocated\n");
+    mrs_printf("mrs_free: freed base address not allocated\n");
     mrs_unlock(&allocations_lock);
     return;
   }
@@ -666,7 +670,7 @@ void mrs_free(void *ptr) {
 #endif /* SANITIZE */
 
   if (remove_alloc_desc(alloc_desc) == NULL) {
-    mrs_debug_printf("mrs_free: could not remove alloc descriptor\n");
+    mrs_printf("mrs_free: could not remove alloc descriptor\n");
     mrs_unlock(&allocations_lock);
     return;
   }
@@ -709,7 +713,7 @@ void mrs_free(void *ptr) {
     while (full_quarantine != NULL) {
       mrs_debug_printf("mrs_free: waiting for full_quarantine to drain\n");
       if (pthread_cond_wait(&full_quarantine_empty, &full_quarantine_lock)) {
-        mrs_debug_printf("pthread error\n");
+        mrs_printf("pthread error\n");
         exit(7);
       }
     }
@@ -723,7 +727,7 @@ void mrs_free(void *ptr) {
 
 #ifdef OFFLOAD_QUARANTINE
     if (pthread_cond_signal(&full_quarantine_ready)) {
-        mrs_debug_printf("pthread error\n");
+        mrs_printf("pthread error\n");
         exit(7);
     }
 #else /* OFFLOAD_QUARANTINE */
@@ -765,7 +769,7 @@ void *mrs_calloc(size_t number, size_t size) {
    * for bitmap painting by increasing the size.
    */
   if ((number * size) < CAPREVOKE_BITMAP_ALIGNMENT) {
-    mrs_debug_printf("mrs_calloc: size under caprevoke alignment, increasing size\n");
+    mrs_printf("mrs_calloc: size under caprevoke alignment, increasing size\n");
     size = CAPREVOKE_BITMAP_ALIGNMENT;
   }
 #endif /* STANDALONE */
@@ -774,7 +778,7 @@ void *mrs_calloc(size_t number, size_t size) {
 
 #ifdef MALLOC_PREFIX
   if ((cheri_getbase(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_debug_printf("mrs_calloc: caprevoke bitmap alignment violated\n");
+    mrs_printf("mrs_calloc: caprevoke bitmap alignment violated\n");
     exit(7);
   }
 #endif /* MALLOC_PREFIX */
