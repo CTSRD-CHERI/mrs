@@ -64,7 +64,8 @@
  * Values:
  *
  * MALLOC_PREFIX: build mrs linked into an existing malloc whose functions are prefixed with MALLOC_PREFIX
- * QUARANTINE_HIGHWATER: the quarantine size in bytes at which to carry out revocation (default 2MB) TODO percentage based
+ * QUARANTINE_HIGHWATER: limit the quarantine size to QUARANTINE_HIGHWATER number of bytes
+ * QUARANTINE_RATIO: limit the quarantine size to 1 / QUARANTINE_RATIO times the size of the heap (default 4)
  *
  * TODO knobs for ablation study
  * TODO knob for halting on property violation rather than continuing
@@ -93,10 +94,6 @@
 #define concat(a, b) concat_resolved(a,b)
 
 #define cheri_testsubset(x, y) __builtin_cheri_subset_test((x), (y))
-
-#ifndef QUARANTINE_HIGHWATER
-#define QUARANTINE_HIGHWATER (1024L * 1024 * 2)
-#endif /* !QUARANTINE_HIGHWATER */
 
 /* function declarations and definitions */
 
@@ -172,11 +169,11 @@ struct mrs_alloc_desc {
   RB_ENTRY(mrs_alloc_desc) linkage;
 };
 
-static size_t psize;
+static size_t page_size;
 /* alignment requirement for allocations so they can be painted in the caprevoke bitmap */
 static const size_t CAPREVOKE_BITMAP_ALIGNMENT = 16;
-
 static const size_t NEW_DESCRIPTOR_BATCH_SIZE = 10000;
+static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
 static RB_HEAD(mrs_shadow_desc_head, mrs_shadow_desc) shadow_spaces;
 static struct mrs_shadow_desc *free_shadow_descs;
@@ -184,8 +181,10 @@ static struct mrs_shadow_desc *free_shadow_descs;
 static RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
 static struct mrs_alloc_desc *free_alloc_descs;
 
-static struct mrs_alloc_desc *quarantine;
+static size_t allocated;
+static size_t max_allocated;
 static size_t quarantine_size;
+static struct mrs_alloc_desc *quarantine;
 static struct mrs_alloc_desc *full_quarantine;
 
 static void *(*real_malloc) (size_t);
@@ -415,7 +414,7 @@ initialize_lock(full_quarantine_lock);
   real_munmap = dlsym(RTLD_NEXT, "munmap");
   real_madvise = dlsym(RTLD_NEXT, "madvise");
   real_posix_madvise = dlsym(RTLD_NEXT, "posix_madvise");
-#elif defined(MALLOC_PREFIX)
+#elif /* STANDALONE */ defined(MALLOC_PREFIX)
   real_malloc = concat(MALLOC_PREFIX, _malloc);
   real_free = concat(MALLOC_PREFIX, _free);
   real_calloc = concat(MALLOC_PREFIX, _calloc);
@@ -426,9 +425,9 @@ initialize_lock(full_quarantine_lock);
   real_munmap = munmap;
   real_madvise = madvise;
   real_posix_madvise = posix_madvise;
-#else
+#else /* !STANDALONE && MALLOC_PREFIX */
 #error must build mrs with either STANDALONE or MALLOC_PREFIX defined
-#endif
+#endif /* !(STANDALONE || MALLOC_PREFIX) */
 
 #ifdef OFFLOAD_QUARANTINE
   /* spawn offload thread XXX in purecap spwaning this thread in init() causes main() not to be called */
@@ -439,9 +438,9 @@ initialize_lock(full_quarantine_lock);
   }
 #endif /* OFFLOAD_QUARANTINE */
 
-  psize = getpagesize();
-  if ((psize & (psize - 1)) != 0) {
-    mrs_printf("psize not power of 2\n");
+  page_size = getpagesize();
+  if ((page_size & (page_size - 1)) != 0) {
+    mrs_printf("page_size not power of 2\n");
     exit(7);
   }
 }
@@ -592,6 +591,11 @@ void *mrs_malloc(size_t size) {
   memset(allocated_region, 0, cheri_getlen(allocated_region));
 #endif /* CLEAR_ALLOCATIONS */
 
+  allocated += size;
+  if (allocated > max_allocated) {
+    max_allocated= allocated;
+  }
+
   mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, allocated_region);
 
   return allocated_region;
@@ -694,6 +698,7 @@ void mrs_free(void *ptr) {
   }
   mrs_unlock(&allocations_lock);
 
+  allocated -= cheri_getlen(ptr);
 
 #ifdef BYPASS_QUARANTINE
   /*
@@ -708,8 +713,8 @@ void mrs_free(void *ptr) {
    */
   vaddr_t base = cheri_getbase(alloc_desc->vmmap_cap);
   size_t region_size = cheri_getlen(alloc_desc->vmmap_cap);
-  if (((base & (psize - 1)) == 0) &&
-      ((region_size & (psize - 1)) == 0)) {
+  if (((base & (page_size - 1)) == 0) &&
+      ((region_size & (page_size - 1)) == 0)) {
     mrs_debug_printf("mrs_free: page-multiple free, bypassing quarantine\n");
     real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE);
     free_alloc_desc(alloc_desc);
@@ -723,8 +728,22 @@ void mrs_free(void *ptr) {
   quarantine = alloc_desc;
   quarantine_size += cheri_getlen(alloc_desc->allocated_region);
 
-  if (quarantine_size >= QUARANTINE_HIGHWATER) {
-    mrs_debug_printf("mrs_free: passed quarantine highwater of %lu, revoking\n", QUARANTINE_HIGHWATER);
+  bool should_revoke;
+
+#if defined(QUARANTINE_HIGHWATER)
+  should_revoke = (quarantine_size >= QUARANTINE_HIGHWATER);
+#else /* QUARANTINE_HIGHWATER */
+
+#  if !defined(QUARANTINE_RATIO)
+#    define QUARANTINE_RATIO 4
+#  endif /* !QUARANTINE_RATIO */
+
+  should_revoke = ((allocated >= MIN_REVOKE_HEAP_SIZE) && ((quarantine_size * QUARANTINE_RATIO) >= allocated));
+
+#endif /* !QUARANTINE_HIGHWATER */
+
+  if (should_revoke) {
+    mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: heap size %zu quarantine %zu\n", allocated, quarantine_size);
 
     mrs_lock(&full_quarantine_lock);
 #ifdef OFFLOAD_QUARANTINE
@@ -806,6 +825,11 @@ void *mrs_calloc(size_t number, size_t size) {
   }
 
   /* TODO clear alloacation if SANITIZE? */
+
+  allocated += size;
+  if (allocated > max_allocated) {
+    max_allocated = allocated;
+  }
 
   mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);
 
