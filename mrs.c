@@ -61,6 +61,7 @@
  * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
  * SANITIZE: perform sanitization on mrs function calls
+ * DONT_REVOKE: don't actually perform any quarantining or revocation
  *
  * Values:
  *
@@ -210,7 +211,7 @@ static int (*real_posix_madvise) (void *, size_t, int);
 int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size_t, size_t));
 #define create_lock(name) \
   pthread_mutex_t name; \
-  char name ## _buf[256]; \
+  char name ## _buf[256] __attribute__((aligned(16))); \
   void *name ## _storage() { \
     return name ## _buf; \
   }
@@ -449,7 +450,7 @@ initialize_lock(full_quarantine_lock);
 #ifdef PRINT_STATS
 __attribute__((destructor))
 static void fini(void) {
-  mrs_printf("fini: heap size %zu max heap size %zu\n", heap_size, max_heap_size);
+  mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu\n", heap_size, max_heap_size, quarantine_size);
 }
 #endif /* PRINT_STATS */
 
@@ -708,6 +709,10 @@ void mrs_free(void *ptr) {
 
   heap_size -= cheri_getlen(ptr);
 
+#ifdef DONT_REVOKE
+  return real_free(ptr);
+#endif /* DONT_REVOKE */
+
 #ifdef BYPASS_QUARANTINE
   /*
    * if this is a full-page(s) allocation, bypass the quarantine by
@@ -792,8 +797,8 @@ void mrs_free(void *ptr) {
  */
 void *mrs_calloc(size_t number, size_t size) {
   static int count = 0;
-  static char thread[4096] = {0};
-  static char sleep_queue[256] = {0};
+  static char thread[1968] __attribute__((aligned(16))) = {0}; //1968 sizeof struct pthread in libthr/thread/thr_private.h
+  static char sleep_queue[128] __attribute__((aligned(16))) = {0}; //128 sizeof struct sleepqueue in libthr/thread/thr_private.h
   if (count == 0) {
     count++;
     return thread;
