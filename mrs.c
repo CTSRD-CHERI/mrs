@@ -58,6 +58,7 @@
  * BYPASS_QUARANTINE: MADV_FREE page-multiple allocations and never free them back to the allocator
  * OFFLOAD_QUARANTINE: process full quarantines in a separate detached thread
  * DEBUG: print debug statements
+ * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
  * SANITIZE: perform sanitization on mrs function calls
  *
@@ -181,8 +182,8 @@ static struct mrs_shadow_desc *free_shadow_descs;
 static RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
 static struct mrs_alloc_desc *free_alloc_descs;
 
-static size_t allocated;
-static size_t max_allocated;
+static size_t heap_size;
+static size_t max_heap_size;
 static size_t quarantine_size;
 static struct mrs_alloc_desc *quarantine;
 static struct mrs_alloc_desc *full_quarantine;
@@ -445,6 +446,13 @@ initialize_lock(full_quarantine_lock);
   }
 }
 
+#ifdef PRINT_STATS
+__attribute__((destructor))
+static void fini(void) {
+  mrs_printf("fini: heap size %zu max heap size %zu\n", heap_size, max_heap_size);
+}
+#endif /* PRINT_STATS */
+
 /* mrs functions */
 
 void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
@@ -591,9 +599,9 @@ void *mrs_malloc(size_t size) {
   memset(allocated_region, 0, cheri_getlen(allocated_region));
 #endif /* CLEAR_ALLOCATIONS */
 
-  allocated += size;
-  if (allocated > max_allocated) {
-    max_allocated= allocated;
+  heap_size += size;
+  if (heap_size > max_heap_size) {
+    max_heap_size = heap_size;
   }
 
   mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, allocated_region);
@@ -698,7 +706,7 @@ void mrs_free(void *ptr) {
   }
   mrs_unlock(&allocations_lock);
 
-  allocated -= cheri_getlen(ptr);
+  heap_size -= cheri_getlen(ptr);
 
 #ifdef BYPASS_QUARANTINE
   /*
@@ -738,12 +746,12 @@ void mrs_free(void *ptr) {
 #    define QUARANTINE_RATIO 4
 #  endif /* !QUARANTINE_RATIO */
 
-  should_revoke = ((allocated >= MIN_REVOKE_HEAP_SIZE) && ((quarantine_size * QUARANTINE_RATIO) >= allocated));
+  should_revoke = ((heap_size >= MIN_REVOKE_HEAP_SIZE) && ((quarantine_size * QUARANTINE_RATIO) >= heap_size));
 
 #endif /* !QUARANTINE_HIGHWATER */
 
   if (should_revoke) {
-    mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: heap size %zu quarantine %zu\n", allocated, quarantine_size);
+    mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: heap size %zu quarantine size %zu\n", heap_size, quarantine_size);
 
     mrs_lock(&full_quarantine_lock);
 #ifdef OFFLOAD_QUARANTINE
@@ -826,9 +834,9 @@ void *mrs_calloc(size_t number, size_t size) {
 
   /* TODO clear alloacation if SANITIZE? */
 
-  allocated += size;
-  if (allocated > max_allocated) {
-    max_allocated = allocated;
+  heap_size += size;
+  if (heap_size> max_heap_size) {
+    max_heap_size = heap_size;
   }
 
   mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);
