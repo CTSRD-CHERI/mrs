@@ -1,11 +1,46 @@
 cmake_minimum_required(VERSION 3.8)
 project(mrs C CXX)
 
-# options: choose output and config; offload quarantine, bypass quarantine, debug, etc
+# the default behavior is to build libraries with a 25% heap-size quarantine
+# that will be revoked when it is at least 2MB in size.
+
+option(DEBUG "enable debug output" OFF)
+option(OFFLOAD_QUARANTINE "process the quarantine in a separate worker thread" OFF)
+option(BYPASS_QUARANTINE "MADV_FREE freed page-size allocations" OFF)
+option(CLEAR_ALLOCATIONS "zero out allocations made by malloc" OFF)
+
+if(DEBUG)
+  message("defining DEBUG")
+  add_compile_definitions(DEBUG)
+endif()
+if(OFFLOAD_QUARANTINE)
+  message("defining OFFLOAD_QUARANTINE")
+  add_compile_definitions(OFFLOAD_QUARANTINE)
+endif()
+if(BYPASS_QUARANTINE)
+  message("defining BYPASS_QUARANTINE")
+  add_compile_definitions(BYPASS_QUARANTINE)
+endif()
+if(CLEAR_ALLOCATIONS)
+  message("defining CLEAR_ALLOCATIONS")
+  add_compile_definitions(CLEAR_ALLOCATIONS)
+endif()
+
+set(QUARANTINE_RATIO "" CACHE STRING "limit the quarantine size to 1/ QUARANTINE_RATIO times the size of the heap")
+set(QUARANTINE_HIGHWATER "" CACHE STRING "limit the quarantine size to QUARANTINE_HIGHWATER bytes (supersedes QUARANTINE_RATIO)")
+
+if(NOT QUARANTINE_RATIO STREQUAL "")
+  message("defining QUARANTINE_RATIO=${QUARANTINE_RATIO}")
+  add_compile_definitions(QUARANTINE_RATIO=${QUARANTINE_RATIO})
+endif()
+if(NOT QUARANTINE_HIGHWATER STREQUAL "")
+  message("defining QUARANTINE_HIGHWATER=${QUARANTINE_HIGHWATER}")
+  add_compile_definitions(QUARANTINE_HIGHWATER=${QUARANTINE_HIGHWATER})
+endif()
 
 # build standalone
 add_library(mrs SHARED mrs.c printf.c)
-target_compile_definitions(mrs PRIVATE STANDALONE DEBUG)
+target_compile_definitions(mrs PRIVATE STANDALONE)
 target_link_libraries(mrs pthread cheri_caprevoke)
 
 # build jemalloc
@@ -17,7 +52,7 @@ set(JEMALLOC_SRC jemalloc.c arena.c background_thread.c base.c bin.c
 list(TRANSFORM JEMALLOC_SRC PREPEND ./jemalloc/src/)
 add_library(jemalloc SHARED mrs.c printf.c ${JEMALLOC_SRC})
 target_include_directories(jemalloc PRIVATE . ./jemalloc/include)
-target_compile_definitions(jemalloc PRIVATE JEMALLOC_NO_RENAME MALLOC_PREFIX=je DEBUG)
+target_compile_definitions(jemalloc PRIVATE JEMALLOC_NO_RENAME MALLOC_PREFIX=je)
 target_link_libraries(jemalloc pthread cheri_caprevoke)
 
 # build test
