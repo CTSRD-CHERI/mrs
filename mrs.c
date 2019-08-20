@@ -90,8 +90,12 @@
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
- * SANITIZE: perform sanitization on mrs function calls
- * DONT_REVOKE: don't actually perform any quarantining or revocation
+ * SANITIZE: perform sanitization on mrs function calls, TODO? exit when desired property violated
+ *
+ * JUST_INTERPOSE: just call the real functions
+ * JUST_BOOKKEEPING: just update data structures then call the real functions
+ * JUST_QUARANTINE: just do bookkeeping and quarantining (no bitmap painting or revocation)
+ * JUST_PAINT_BITMAP: do bookkeeping, quarantining, and bitmap painting but no revocation
  *
  * Values:
  *
@@ -99,8 +103,6 @@
  * QUARANTINE_HIGHWATER: limit the quarantine size to QUARANTINE_HIGHWATER number of bytes
  * QUARANTINE_RATIO: limit the quarantine size to 1 / QUARANTINE_RATIO times the size of the heap (default 4)
  *
- * TODO knobs for ablation study
- * TODO knob for halting on property violation rather than continuing
  */
 
 /*
@@ -487,6 +489,9 @@ static void fini(void) {
 /* mrs functions */
 
 void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
+#ifdef JUST_INTERPOSE
+  return real_mmap(addr, len, prot, flags, fd, offset);
+#endif /* JUST_INTERPOSE */
   mrs_debug_printf("mrs_mmap: called with addr %p len 0x%zx prot 0x%x flags 0x%x fd %d offset 0x%zx\n", addr, len, prot, flags, fd, offset);
 
   void *mmap_region = real_mmap(addr, len, prot, flags, fd, offset);
@@ -523,6 +528,10 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
 }
 
 int mrs_munmap(void *addr, size_t len) {
+#ifdef JUST_INTERPOSE
+    return real_munmap(addr, len);
+#endif /* JUST_INTERPOSE */
+
   mrs_debug_printf("mrs_munmap: called\n");
 
   mrs_lock(&shadow_spaces_lock);
@@ -545,11 +554,19 @@ int mrs_munmap(void *addr, size_t len) {
 
 /* TODO write these */
 int mrs_madvise(void *addr, size_t len, int behav) {
-  mrs_debug_printf("mrs_madvise: called\n");
+#ifdef JUST_INTERPOSE
+    return real_madvise(addr, len, behav);
+#endif /* JUST_INTERPOSE */
+
+  mrs_printf("mrs_madvise: called\n");
   return real_madvise(addr, len, behav);
 }
 int mrs_posix_madvise(void *addr, size_t len, int behav) {
-  mrs_debug_printf("mrs_posix_madvise: called\n");
+#ifdef JUST_INTERPOSE
+    return real_posix_madvise(addr, len, behav);
+#endif /* JUST_INTERPOSE */
+
+  mrs_printf("mrs_posix_madvise: called\n");
   return real_posix_madvise(addr, len, behav);
 }
 
@@ -595,6 +612,9 @@ static int insert_allocation(void *allocated_region) {
 }
 
 void *mrs_malloc(size_t size) {
+#ifdef JUST_INTERPOSE
+    return real_malloc(size);
+#endif /* JUST_INTERPOSE */
 
   /*mrs_debug_printf("mrs_malloc: called\n");*/
 
@@ -647,22 +667,28 @@ void *mrs_malloc(size_t size) {
  * with each core painting, we wil need to use (at least part of) the non-raw
  * functions. we will also need to use different caprevoke() calls.
  */
-void flush_full_quarantine() {
+static void flush_full_quarantine() {
   struct mrs_alloc_desc *iter = full_quarantine;
+#if !defined(JUST_QUARANTINE)
   while (iter != NULL) {
     /*caprev_shadow_nomap_set(iter->shadow, iter->vmmap_cap, iter->allocated_region);*/
     caprev_shadow_nomap_set_raw(iter->shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
     iter = iter->next;
   }
+#endif /* !JUST_QUARANTINE */
 
+#if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
   struct caprevoke_stats crst;
   caprevoke(CAPREVOKE_LAST_PASS|CAPREVOKE_IGNORE_START, 0, &crst);
+#endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
 
   struct mrs_alloc_desc *prev;
   iter = full_quarantine;
   while (iter != NULL) {
+#if !defined(JUST_QUARANTINE)
     /*caprev_shadow_nomap_clear(iter->shadow, iter->allocated_region);*/
     caprev_shadow_nomap_clear_raw(iter->shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
+#endif /* !JUST_QUARANTINE */
     real_free(iter->vmmap_cap);
 #ifdef SANITIZE
     mrs_lock(&shadow_spaces_lock);
@@ -706,6 +732,10 @@ static void *full_quarantine_offload(void *arg) {
 #endif /* OFFLOAD_QUARANTINE */
 
 void mrs_free(void *ptr) {
+#ifdef JUST_INTERPOSE
+    return real_free(ptr);
+#endif /* JUST_INTERPOSE */
+
 
   mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
@@ -719,6 +749,9 @@ void mrs_free(void *ptr) {
   if (alloc_desc == NULL) {
     mrs_printf("mrs_free: freed base address not allocated\n");
     mrs_unlock(&allocations_lock);
+#ifdef SANITIZE
+    exit(7);
+#endif /* SANITIZE */
     return;
   }
 
@@ -739,9 +772,9 @@ void mrs_free(void *ptr) {
 
   heap_size -= cheri_getlen(ptr);
 
-#ifdef DONT_REVOKE
-  return real_free(ptr);
-#endif /* DONT_REVOKE */
+#ifdef JUST_BOOKKEEPING
+  real_free(ptr);
+#endif /* JUST_BOOKKEEPING */
 
 #ifdef BYPASS_QUARANTINE
   /*
@@ -763,7 +796,7 @@ void mrs_free(void *ptr) {
     free_alloc_desc(alloc_desc);
     return;
   }
-#endif
+#endif /* BYPASS_QUARANTINE */
 
   /* add the allocation descriptor to quarantine */
   mrs_lock(&quarantine_lock);
@@ -836,6 +869,10 @@ void *mrs_calloc(size_t number, size_t size) {
     count++;
     return sleep_queue;
   }
+#ifdef JUST_INTERPOSE
+    return real_calloc(number, size);
+#endif /* JUST_INTERPOSE */
+
 
   /*mrs_debug_printf("mrs_calloc: called\n");*/
 
@@ -884,6 +921,10 @@ void *mrs_calloc(size_t number, size_t size) {
  * in-place realloc
  */
 void *mrs_realloc(void *ptr, size_t size) {
+#ifdef JUST_INTERPOSE
+    return real_realloc(ptr, size);
+#endif /* JUST_INTERPOSE */
+
   mrs_debug_printf("mrs_realloc: called\n");
 
   if (ptr == NULL) {
@@ -899,10 +940,18 @@ void *mrs_realloc(void *ptr, size_t size) {
 
 /* TODO write these */
 int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
-  mrs_debug_printf("mrs_posix_memalign: called\n");
+#ifdef JUST_INTERPOSE
+    return real_posix_memalign(ptr, alignment, size);
+#endif /* JUST_INTERPOSE */
+
+  mrs_printf("mrs_posix_memalign: called\n");
   return real_posix_memalign(ptr, alignment, size);
 }
 void *mrs_aligned_alloc(size_t alignment, size_t size) {
-  mrs_debug_printf("mrs_aligned_alloc: called\n");
+#ifdef JUST_INTERPOSE
+    return real_aligned_alloc(alignment, size);
+#endif /* JUST_INTERPOSE */
+
+  mrs_printf("mrs_aligned_alloc: called\n");
   return real_aligned_alloc(alignment, size);
 }
