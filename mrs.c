@@ -86,7 +86,7 @@
  *
  * STANDALONE: build mrs as a standalone shared library
  * BYPASS_QUARANTINE: MADV_FREE page-multiple allocations and never free them back to the allocator
- * OFFLOAD_QUARANTINE: process full quarantines in a separate detached thread
+ * OFFLOAD_QUARANTINE: process full quarantines in a separate thread
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
@@ -577,7 +577,7 @@ static int insert_allocation(void *allocated_region) {
    * and create a descriptor for it.
    */
   mrs_lock(&shadow_spaces_lock);
-  void *shadow_desc = lookup_shadow_desc_by_allocation(allocated_region);
+  struct mrs_shadow_desc *shadow_desc = lookup_shadow_desc_by_allocation(allocated_region);
   if (shadow_desc == NULL) {
     mrs_unlock(&shadow_spaces_lock);
     mrs_printf("insert_allocation: looking up shadow space failed\n");
