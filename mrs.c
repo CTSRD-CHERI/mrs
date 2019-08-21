@@ -558,7 +558,7 @@ int mrs_madvise(void *addr, size_t len, int behav) {
     return real_madvise(addr, len, behav);
 #endif /* JUST_INTERPOSE */
 
-  mrs_printf("mrs_madvise: called behav %d\n", behav);
+  mrs_debug_printf("mrs_madvise: called behav %d\n", behav);
   return real_madvise(addr, len, behav);
 }
 int mrs_posix_madvise(void *addr, size_t len, int behav) {
@@ -641,6 +641,9 @@ void *mrs_malloc(size_t size) {
     exit(7);
   }
 #endif /* MALLOC_PREFIX */
+
+  // TODO check the alignment of the allocation for standalone and malloc prefix,
+  // also refactor more of malloc and calloc
 
   if (insert_allocation(allocated_region)) {
     return NULL;
@@ -736,7 +739,6 @@ void mrs_free(void *ptr) {
     return real_free(ptr);
 #endif /* JUST_INTERPOSE */
 
-
   mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
   if (ptr == NULL) {
@@ -747,7 +749,7 @@ void mrs_free(void *ptr) {
   mrs_lock(&allocations_lock);
   struct mrs_alloc_desc *alloc_desc = lookup_alloc_desc(ptr);
   if (alloc_desc == NULL) {
-    mrs_printf("mrs_free: freed base address not allocated\n");
+    mrs_printf("mrs_free: freed base address %p not allocated\n", ptr);
     mrs_unlock(&allocations_lock);
 #ifdef SANITIZE
     exit(7);
