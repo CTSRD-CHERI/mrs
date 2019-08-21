@@ -82,10 +82,14 @@ set(JEMALLOC_SRC jemalloc.c arena.c background_thread.c base.c bin.c
   pages.c prng.c prof.c rtree.c stats.c sz.c tcache.c ticker.c tsd.c
   witness.c)
 list(TRANSFORM JEMALLOC_SRC PREPEND ./jemalloc/src/)
-add_library(jemalloc SHARED mrs.c printf.c ${JEMALLOC_SRC})
+
+add_library(jemalloc SHARED ${JEMALLOC_SRC})
 target_include_directories(jemalloc PRIVATE . ./jemalloc/include)
-target_compile_definitions(jemalloc PRIVATE JEMALLOC_NO_RENAME MALLOC_PREFIX=je)
-target_link_libraries(jemalloc pthread cheri_caprevoke)
+
+add_library(jemalloc-mrs SHARED mrs.c printf.c ${JEMALLOC_SRC})
+target_include_directories(jemalloc-mrs PRIVATE . ./jemalloc/include)
+target_compile_definitions(jemalloc-mrs PRIVATE JEMALLOC_NO_RENAME MALLOC_PREFIX=je)
+target_link_libraries(jemalloc-mrs pthread cheri_caprevoke)
 
 # build test
 add_executable(mrstest test/test.c)

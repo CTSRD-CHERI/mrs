@@ -12,6 +12,12 @@
  * }
  * CHERI CHANGES END
  */
+#ifdef MALLOC_PREFIX
+#define mmap(addr, len, prot, flags, fd, offset) mrs_mmap(addr, len, prot, flags, fd, offset)
+#define munmap(addr, len) mrs_munmap(addr, len)
+#define madvise(addr, len, behav) mrs_madvise(addr, len, behav)
+#endif
+
 #define JEMALLOC_PAGES_C_
 #include "jemalloc/internal/jemalloc_preamble.h"
 
@@ -102,7 +108,7 @@ os_pages_map(void *addr, size_t size, size_t alignment, bool *commit) {
 	{
 		int prot = *commit ? PAGES_PROT_COMMIT : PAGES_PROT_DECOMMIT;
 
-		ret = mrs_mmap(addr, size, prot, mmap_flags, -1, 0);
+		ret = mmap(addr, size, prot, mmap_flags, -1, 0);
 	}
 	assert(ret != NULL);
 
@@ -158,7 +164,7 @@ os_pages_unmap(void *addr, size_t size) {
 #ifdef _WIN32
 	if (VirtualFree(addr, 0, MEM_RELEASE) == 0)
 #else
-	if (mrs_munmap(addr, size) == -1)
+	if (munmap(addr, size) == -1)
 #endif
 	{
 		char buf[BUFERROR_BUF];
@@ -232,7 +238,7 @@ pages_map(void *addr, size_t size, size_t alignment, bool *commit) {
 			flags |= MAP_ALIGNED(alignment_bits - 1);
 		}
 
-		void *ret = mrs_mmap(addr, size, prot, flags, -1, 0);
+		void *ret = mmap(addr, size, prot, flags, -1, 0);
 		if (ret == MAP_FAILED) {
 			ret = NULL;
 		}
@@ -291,7 +297,7 @@ pages_commit_impl(void *addr, size_t size, bool commit) {
 #else
 	{
 		int prot = commit ? PAGES_PROT_COMMIT : PAGES_PROT_DECOMMIT;
-		void *result = mrs_mmap(addr, size, prot, mmap_flags | MAP_FIXED,
+		void *result = mmap(addr, size, prot, mmap_flags | MAP_FIXED,
 		    -1, 0);
 		if (result == MAP_FAILED) {
 			return true;
@@ -339,7 +345,7 @@ pages_purge_lazy(void *addr, size_t size) {
 	VirtualAlloc(addr, size, MEM_RESET, PAGE_READWRITE);
 	return false;
 #elif defined(JEMALLOC_PURGE_MADVISE_FREE)
-	return (mrs_madvise(addr, size,
+	return (madvise(addr, size,
 #  ifdef MADV_FREE
 	    MADV_FREE
 #  else
@@ -348,7 +354,7 @@ pages_purge_lazy(void *addr, size_t size) {
 	    ) != 0);
 #elif defined(JEMALLOC_PURGE_MADVISE_DONTNEED) && \
     !defined(JEMALLOC_PURGE_MADVISE_DONTNEED_ZEROS)
-	return (mrs_madvise(addr, size, MADV_DONTNEED) != 0);
+	return (madvise(addr, size, MADV_DONTNEED) != 0);
 #else
 	not_reached();
 #endif
@@ -365,7 +371,7 @@ pages_purge_forced(void *addr, size_t size) {
 
 #if defined(JEMALLOC_PURGE_MADVISE_DONTNEED) && \
     defined(JEMALLOC_PURGE_MADVISE_DONTNEED_ZEROS)
-	return (mrs_madvise(addr, size, MADV_DONTNEED) != 0);
+	return (madvise(addr, size, MADV_DONTNEED) != 0);
 #elif defined(JEMALLOC_MAPS_COALESCE)
 	/* Try to overlay a new demand-zeroed mapping. */
 	return pages_commit(addr, size);
@@ -381,7 +387,7 @@ pages_huge_impl(void *addr, size_t size, bool aligned) {
 		assert(HUGEPAGE_CEILING(size) == size);
 	}
 #ifdef JEMALLOC_HAVE_MADVISE_HUGE
-	return (mrs_madvise(addr, size, MADV_HUGEPAGE) != 0);
+	return (madvise(addr, size, MADV_HUGEPAGE) != 0);
 #else
 	return true;
 #endif
@@ -405,7 +411,7 @@ pages_nohuge_impl(void *addr, size_t size, bool aligned) {
 	}
 
 #ifdef JEMALLOC_HAVE_MADVISE_HUGE
-	return (mrs_madvise(addr, size, MADV_NOHUGEPAGE) != 0);
+	return (madvise(addr, size, MADV_NOHUGEPAGE) != 0);
 #else
 	return false;
 #endif
@@ -426,7 +432,7 @@ pages_dontdump(void *addr, size_t size) {
 	assert(PAGE_ADDR2BASE(addr) == addr);
 	assert(PAGE_CEILING(size) == size);
 #ifdef JEMALLOC_MADVISE_DONTDUMP
-	return mrs_madvise(addr, size, MADV_DONTDUMP) != 0;
+	return madvise(addr, size, MADV_DONTDUMP) != 0;
 #else
 	return false;
 #endif
@@ -437,7 +443,7 @@ pages_dodump(void *addr, size_t size) {
 	assert(PAGE_ADDR2BASE(addr) == addr);
 	assert(PAGE_CEILING(size) == size);
 #ifdef JEMALLOC_MADVISE_DONTDUMP
-	return mrs_madvise(addr, size, MADV_DODUMP) != 0;
+	return madvise(addr, size, MADV_DODUMP) != 0;
 #else
 	return false;
 #endif
