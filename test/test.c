@@ -36,7 +36,7 @@
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
 void uaf_basic_sub16() {
-  char *buffer = (char *)malloc(1);
+  void *buffer = malloc(1);
   assert(cheri_gettag(buffer));
   free(buffer);
   assert(!cheri_gettag(buffer));
@@ -44,7 +44,7 @@ void uaf_basic_sub16() {
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
 void uaf_basic_16() {
-  char *buffer = (char *)malloc(16);
+  void *buffer = malloc(16);
   assert(cheri_gettag(buffer));
   free(buffer);
   assert(!cheri_gettag(buffer));
@@ -52,15 +52,15 @@ void uaf_basic_16() {
 
 /* should trigger debug statements */
 void free_pages() {
-  char *buffer = (char *)malloc(0x1000);
+  void *buffer = malloc(0x1000);
   free(buffer);
-  buffer = (char *)malloc(0x2000);
+  buffer = malloc(0x2000);
   free(buffer);
 }
 
 /* expects revocation not to happen (doesn't fill quarantine) */
 void uaf_low_water() {
-  char *buffer = (char *)malloc(1);
+  void *buffer = malloc(1);
   assert(cheri_gettag(buffer));
   free(buffer);
   assert(cheri_gettag(buffer));
@@ -68,11 +68,11 @@ void uaf_low_water() {
 
 /* expects revocation to happen (fills quarantine of size 1024, no offload) */
 void uaf_high_water() {
-  char *buffer1 = (char *)malloc(1);
+  void *buffer1 = malloc(1);
   assert(cheri_gettag(buffer1));
   free(buffer1);
   assert(cheri_gettag(buffer1));
-  char *buffer2 = (char *)malloc(1024);
+  void *buffer2 = malloc(1024);
   assert(cheri_gettag(buffer2));
   free(buffer2);
   assert(!cheri_gettag(buffer2));
@@ -80,11 +80,11 @@ void uaf_high_water() {
 
 /* expects revocation to be offloaded (fills quarantine of size 1024, waits for it to work) */
 void uaf_high_water_offload() {
-  char *buffer1 = (char *)malloc(1);
+  void *buffer1 = malloc(1);
   assert(cheri_gettag(buffer1));
   free(buffer1);
   assert(cheri_gettag(buffer1));
-  char *buffer2 = (char *)malloc(1024);
+  void *buffer2 = malloc(1024);
   assert(cheri_gettag(buffer2));
   free(buffer2);
   assert(cheri_gettag(buffer2));
@@ -92,15 +92,31 @@ void uaf_high_water_offload() {
   assert(!cheri_gettag(buffer2));
 }
 
+/* basic stress test with many mallocs and frees */
+void basic_stress_test(int num_allocs) {
+  void **allocs = malloc(sizeof(void *) * num_allocs);
+  int i = 0;
+  while (i < num_allocs) {
+    allocs[i] = malloc(1024);
+    i++;
+  }
+  while (i > 0) {
+    free(allocs[i - 1]);
+    i--;
+  }
+  free(allocs);
+}
+
 
 int main(int argc, char *argv[]) {
   printf("mrs test start\n");
-  uaf_basic_sub16();
-  uaf_basic_16();
-  free_pages();
+  /*uaf_basic_sub16();*/
+  /*uaf_basic_16();*/
+  /*free_pages();*/
   /*uaf_printf();*/
   /*uaf_low_water();*/
   /*uaf_high_water();*/
   /*uaf_high_water_offload();*/
+  basic_stress_test(1024 * 16);
   printf("mrs test end\n");
 }
