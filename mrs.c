@@ -558,7 +558,7 @@ int mrs_madvise(void *addr, size_t len, int behav) {
     return real_madvise(addr, len, behav);
 #endif /* JUST_INTERPOSE */
 
-  mrs_printf("mrs_madvise: called\n");
+  mrs_printf("mrs_madvise: called behav %d\n", behav);
   return real_madvise(addr, len, behav);
 }
 int mrs_posix_madvise(void *addr, size_t len, int behav) {
@@ -774,6 +774,8 @@ void mrs_free(void *ptr) {
 
 #ifdef JUST_BOOKKEEPING
   real_free(ptr);
+  free_alloc_desc(alloc_desc);
+  return;
 #endif /* JUST_BOOKKEEPING */
 
 #ifdef BYPASS_QUARANTINE
