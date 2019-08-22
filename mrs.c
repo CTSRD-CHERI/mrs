@@ -823,7 +823,7 @@ void mrs_free(void *ptr) {
 #endif /* !QUARANTINE_HIGHWATER */
 
   if (should_revoke) {
-    mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: heap size %zu quarantine size %zu\n", heap_size, quarantine_size);
+    mrs_printf("mrs_free: passed quarantine threshold, revoking: heap size %zu quarantine size %zu\n", heap_size, quarantine_size);
 
     mrs_lock(&full_quarantine_lock);
 #ifdef OFFLOAD_QUARANTINE
