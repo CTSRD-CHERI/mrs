@@ -643,8 +643,10 @@ void *mrs_malloc(size_t size) {
   }
 #endif /* MALLOC_PREFIX */
 
-  // TODO check the alignment of the allocation for standalone and malloc prefix,
-  // also refactor more of malloc and calloc
+  if ((cheri_getlen(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
+    mrs_printf("mrs_malloc: caprevoke bitmap size requirement violated\n");
+    exit(7);
+  }
 
   if (insert_allocation(allocated_region)) {
     return NULL;
@@ -907,6 +909,11 @@ void *mrs_calloc(size_t number, size_t size) {
     exit(7);
   }
 #endif /* MALLOC_PREFIX */
+
+  if ((cheri_getlen(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
+    mrs_printf("mrs_calloc: caprevoke bitmap size requirement violated\n");
+    exit(7);
+  }
 
   if (insert_allocation(allocated_region)) {
     return NULL;
