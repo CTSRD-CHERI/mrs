@@ -643,10 +643,12 @@ void *mrs_malloc(size_t size) {
   }
 #endif /* MALLOC_PREFIX */
 
+#ifdef SANITIZE
   if ((cheri_getlen(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_malloc: caprevoke bitmap size requirement violated\n");
+    mrs_printf("mrs_malloc: caprevoke bitmap size requirement violated, %zu\n", cheri_getlen(allocated_region));
     exit(7);
   }
+#endif /* SANITIZE */
 
   if (insert_allocation(allocated_region)) {
     return NULL;
@@ -910,10 +912,12 @@ void *mrs_calloc(size_t number, size_t size) {
   }
 #endif /* MALLOC_PREFIX */
 
+#ifdef SANITIZE
   if ((cheri_getlen(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_calloc: caprevoke bitmap size requirement violated\n");
+    mrs_printf("mrs_calloc: caprevoke bitmap size requirement violated, %zu\n", cheri_getlen(allocated_region));
     exit(7);
   }
+#endif /* SANITIZE */
 
   if (insert_allocation(allocated_region)) {
     return NULL;
