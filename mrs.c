@@ -729,9 +729,9 @@ void mrs_free(void *ptr) {
   struct mrs_shadow_desc *shadow = lookup_shadow_desc_by_allocation(ptr);
   struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr, shadow);
   mrs_lock(&quarantine_lock);
-  desc->next = quarantine;
-  quarantine = desc;
-  quarantine_size += cheri_getlen(desc->allocated_region);
+  alloc->next = quarantine;
+  quarantine = alloc;
+  quarantine_size += cheri_getlen(alloc->allocated_region);
   if (quarantine_size > max_quarantine_size) {
     max_quarantine_size = quarantine_size;
   }
