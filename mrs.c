@@ -202,7 +202,6 @@ struct mrs_alloc_desc {
   void *shadow; /* local copy of shadow capability to avoid locking global shadow_spaces when !SANITIZE */
   struct mrs_shadow_desc *shadow_desc;
   struct mrs_alloc_desc *next;
-  RB_ENTRY(mrs_alloc_desc) linkage;
 };
 
 volatile const struct caprevoke_info *cri;
@@ -216,7 +215,6 @@ static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 static RB_HEAD(mrs_shadow_desc_head, mrs_shadow_desc) shadow_spaces;
 static struct mrs_shadow_desc *free_shadow_descs;
 
-static RB_HEAD(mrs_alloc_desc_head, mrs_alloc_desc) allocations;
 static struct mrs_alloc_desc *free_alloc_descs;
 
 static size_t allocated_size;
@@ -257,7 +255,6 @@ int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size
 create_lock(printf_lock);
 create_lock(shadow_spaces_lock);
 create_lock(free_shadow_descs_lock);
-create_lock(allocations_lock);
 create_lock(free_alloc_descs_lock);
 create_lock(quarantine_lock);
 create_lock(full_quarantine_lock);
@@ -407,34 +404,6 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shado
   return ret;
 }
 
-void free_alloc_desc(struct mrs_alloc_desc *desc) {
-  mrs_lock(&free_alloc_descs_lock);
-  desc->next = free_alloc_descs;
-  free_alloc_descs = desc;
-  mrs_unlock(&free_alloc_descs_lock);
-}
-
-static vaddr_t mrs_alloc_desc_cmp(struct mrs_alloc_desc *e1, struct mrs_alloc_desc *e2) {
-  return cheri_getbase(e1->allocated_region) - cheri_getbase(e2->allocated_region);
-}
-
-RB_PROTOTYPE_STATIC(mrs_alloc_desc_head, mrs_alloc_desc, linkage, mrs_alloc_desc_cmp);
-RB_GENERATE_STATIC(mrs_alloc_desc_head, mrs_alloc_desc, linkage, mrs_alloc_desc_cmp);
-
-static struct mrs_alloc_desc *add_alloc_desc(struct mrs_alloc_desc *add) {
-  return RB_INSERT(mrs_alloc_desc_head, &allocations, add);
-}
-
-static struct mrs_alloc_desc *remove_alloc_desc(struct mrs_alloc_desc *rem) {
-  return RB_REMOVE(mrs_alloc_desc_head, &allocations, rem);
-}
-
-static struct mrs_alloc_desc *lookup_alloc_desc(void *alloc) {
-  struct mrs_alloc_desc lookup = {0};
-  lookup.allocated_region = alloc;
-  return  RB_FIND(mrs_alloc_desc_head, &allocations, &lookup);
-}
-
 /* initialization */
 __attribute__((constructor))
 static void init(void) {
@@ -447,7 +416,6 @@ static void init(void) {
 initialize_lock(printf_lock);
 initialize_lock(shadow_spaces_lock);
 initialize_lock(free_shadow_descs_lock);
-initialize_lock(allocations_lock);
 initialize_lock(free_alloc_descs_lock);
 initialize_lock(quarantine_lock);
 initialize_lock(full_quarantine_lock);
@@ -588,49 +556,8 @@ int mrs_posix_madvise(void *addr, size_t len, int behav) {
     return real_posix_madvise(addr, len, behav);
 #endif /* JUST_INTERPOSE */
 
-  mrs_printf("mrs_posix_madvise: called\n");
+  mrs_debug_printf("mrs_posix_madvise: called\n");
   return real_posix_madvise(addr, len, behav);
-}
-
-static int insert_allocation(void *allocated_region) {
-
-  /*
-   * find the shadow space corresponding to the allocated region
-   * and create a descriptor for it.
-   */
-  mrs_lock(&shadow_spaces_lock);
-  struct mrs_shadow_desc *shadow_desc = lookup_shadow_desc_by_allocation(allocated_region);
-  if (shadow_desc == NULL) {
-    mrs_unlock(&shadow_spaces_lock);
-    mrs_printf("insert_allocation: looking up shadow space failed\n");
-    real_free(allocated_region);
-    return 7;
-  }
-
-  struct mrs_alloc_desc *ins = alloc_alloc_desc(allocated_region, shadow_desc);
-  if (ins == NULL) {
-    mrs_unlock(&shadow_spaces_lock);
-    mrs_printf("insert_allocation: ran out of allocation descriptors\n");
-    real_free(allocated_region);
-    return 7;
-  }
-
-#ifdef SANITIZE
-  shadow_desc->allocations++;
-#endif /* SANITIZE */
-  mrs_unlock(&shadow_spaces_lock);
-
-  /* add the descriptor to our red-black tree */
-  mrs_lock(&allocations_lock);
-  if (add_alloc_desc(ins)) {
-    mrs_unlock(&allocations_lock);
-    mrs_printf("insert_allocation: duplicate allocation\n");
-    real_free(allocated_region);
-    return 7;
-  }
-  mrs_unlock(&allocations_lock);
-
-  return 0;
 }
 
 void *mrs_malloc(size_t size) {
@@ -670,10 +597,6 @@ void *mrs_malloc(size_t size) {
     exit(7);
   }
 #endif /* SANITIZE */
-
-  if (insert_allocation(allocated_region)) {
-    return NULL;
-  }
 
 #ifdef CLEAR_ALLOCATIONS
   memset(allocated_region, 0, cheri_getlen(allocated_region));
@@ -781,41 +704,6 @@ void mrs_free(void *ptr) {
     return;
   }
 
-  /* find, validate, and remove the allocation descriptor */
-  mrs_lock(&allocations_lock);
-  struct mrs_alloc_desc *alloc_desc = lookup_alloc_desc(ptr);
-  if (alloc_desc == NULL) {
-    mrs_printf("mrs_free: freed base address %p not allocated\n", ptr);
-    mrs_unlock(&allocations_lock);
-#ifdef SANITIZE
-    exit(7);
-#endif /* SANITIZE */
-    return;
-  }
-
-#ifdef SANITIZE
-  if (cheri_getlen(ptr)!= cheri_getlen(alloc_desc->allocated_region)) {
-    mrs_debug_printf("mrs_free: freed base address size mismatch cap len 0x%zx alloc size 0x%zx\n", cheri_getlen(ptr), cheri_getlen(alloc_desc->allocated_region));
-    mrs_unlock(&allocations_lock);
-    return;
-  }
-#endif /* SANITIZE */
-
-  if (remove_alloc_desc(alloc_desc) == NULL) {
-    mrs_printf("mrs_free: could not remove alloc descriptor\n");
-    mrs_unlock(&allocations_lock);
-    return;
-  }
-  mrs_unlock(&allocations_lock);
-
-  allocated_size -= cheri_getlen(ptr);
-
-#ifdef JUST_BOOKKEEPING
-  real_free(ptr);
-  free_alloc_desc(alloc_desc);
-  return;
-#endif /* JUST_BOOKKEEPING */
-
 #ifdef BYPASS_QUARANTINE
   /*
    * if this is a full-page(s) allocation, bypass the quarantine by
@@ -827,22 +715,23 @@ void mrs_free(void *ptr) {
    *
    * TODO maybe coalesce in quarantine? can't reduce free calls unless we get a full page
    */
-  vaddr_t base = cheri_getbase(alloc_desc->vmmap_cap);
-  size_t region_size = cheri_getlen(alloc_desc->vmmap_cap);
+  vaddr_t base = cheri_getbase(ptr);
+  size_t region_size = cheri_getlen(ptr);
   if (((base & (page_size - 1)) == 0) &&
       ((region_size & (page_size - 1)) == 0)) {
     mrs_debug_printf("mrs_free: page-multiple free, bypassing quarantine\n");
-    real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE);
-    free_alloc_desc(alloc_desc);
+    /*real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE); TODO need to lookup and rederive vmmap pointer*/
     return;
   }
 #endif /* BYPASS_QUARANTINE */
 
   /* add the allocation descriptor to quarantine */
+  struct mrs_shadow_desc *shadow = lookup_shadow_desc_by_allocation(ptr);
+  struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr, shadow);
   mrs_lock(&quarantine_lock);
-  alloc_desc->next = quarantine;
-  quarantine = alloc_desc;
-  quarantine_size += cheri_getlen(alloc_desc->allocated_region);
+  desc->next = quarantine;
+  quarantine = desc;
+  quarantine_size += cheri_getlen(desc->allocated_region);
   if (quarantine_size > max_quarantine_size) {
     max_quarantine_size = quarantine_size;
   }
@@ -949,10 +838,6 @@ void *mrs_calloc(size_t number, size_t size) {
     exit(7);
   }
 #endif /* SANITIZE */
-
-  if (insert_allocation(allocated_region)) {
-    return NULL;
-  }
 
   /* TODO clear alloacation if SANITIZE? */
 
