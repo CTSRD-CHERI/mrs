@@ -394,6 +394,13 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shado
   return ret;
 }
 
+void free_alloc_desc(struct mrs_alloc_desc *desc) {
+  mrs_lock(&free_alloc_descs_lock);
+  desc->next = free_alloc_descs;
+  free_alloc_descs = desc;
+  mrs_unlock(&free_alloc_descs_lock);
+}
+
 /* initialization */
 __attribute__((constructor))
 static void init(void) {
@@ -686,6 +693,12 @@ void mrs_free(void *ptr) {
     return;
   }
 
+#ifdef JUST_BOOKKEEPING
+  real_free(ptr);
+  free_alloc_desc(ptr);
+  return;
+#endif /* JUST_BOOKKEEPING */
+
 #ifdef BYPASS_QUARANTINE
   /*
    * if this is a full-page(s) allocation, bypass the quarantine by
@@ -709,6 +722,14 @@ void mrs_free(void *ptr) {
 
   /* add the allocation descriptor to quarantine */
   struct mrs_shadow_desc *shadow = lookup_shadow_desc_by_allocation(ptr);
+  /*
+   * XXX we could do the lookup when flushing quarantine, but this would allow
+   * the application to artificially inflate quarantine size. maybe not a big deal.
+   */
+  if (shadow == NULL) {
+    /* XXX call free even though invalid? */
+    return;
+  }
   struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr, shadow);
   mrs_lock(&quarantine_lock);
   alloc->next = quarantine;
