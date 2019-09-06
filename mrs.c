@@ -184,23 +184,9 @@ void *concat(MALLOC_PREFIX,_aligned_alloc)(size_t, size_t);
 
 /* globals */
 
-/* store mapping between mmaped region and shadow space */
-struct mrs_shadow_desc {
-  void *mmap_region;
-  void *shadow;
-#ifdef SANITIZE
-  int allocations;
-#endif /* SANITIZE */
-  struct mrs_shadow_desc *next;
-  RB_ENTRY(mrs_shadow_desc) linkage;
-};
-
-/* store mapping between allocated region and mmaped region/shadow space */
+/* store info about allocated region */
 struct mrs_alloc_desc {
   void *allocated_region;
-  void *vmmap_cap; /* copy of allocated_region capability with VMMAP permission so it doesn't get revoked, for freeing back to allocator */
-  void *shadow; /* local copy of shadow capability to avoid locking global shadow_spaces when !SANITIZE */
-  struct mrs_shadow_desc *shadow_desc;
   struct mrs_alloc_desc *next;
 };
 
@@ -212,8 +198,7 @@ static const size_t CAPREVOKE_BITMAP_ALIGNMENT = 16;
 static const size_t NEW_DESCRIPTOR_BATCH_SIZE = 10000;
 static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
-static RB_HEAD(mrs_shadow_desc_head, mrs_shadow_desc) shadow_spaces;
-static struct mrs_shadow_desc *free_shadow_descs;
+static void *entire_shadow;
 
 static struct mrs_alloc_desc *free_alloc_descs;
 
@@ -253,8 +238,6 @@ int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size
   }
 
 create_lock(printf_lock);
-create_lock(shadow_spaces_lock);
-create_lock(free_shadow_descs_lock);
 create_lock(free_alloc_descs_lock);
 create_lock(quarantine_lock);
 create_lock(full_quarantine_lock);
@@ -285,6 +268,8 @@ void _putchar(char character) {
 #define mrs_printf(fmt, ...) \
   do {mrs_lock(&printf_lock); printf(("mrs: " fmt), ##__VA_ARGS__); mrs_unlock(&printf_lock);} while (0)
 
+#define mrs_printcap(name, cap) \
+  mrs_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
 
 #ifdef DEBUG
 
@@ -292,7 +277,7 @@ void _putchar(char character) {
   mrs_printf(fmt, ##__VA_ARGS__)
 
 #define mrs_debug_printcap(name, cap) \
-  mrs_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
+  mrs_printcap(name,cap)
 
 #else /* DEBUG */
 
@@ -301,76 +286,9 @@ void _putchar(char character) {
 
 #endif /* !DEBUG */
 
-/* shadow_desc utilities */
-
-struct mrs_shadow_desc *alloc_shadow_desc(void *mmap_region, void *shadow) {
-  struct mrs_shadow_desc *ret;
-  mrs_lock(&free_shadow_descs_lock);
-  if (free_shadow_descs != NULL) {
-    ret = free_shadow_descs;
-    free_shadow_descs = free_shadow_descs->next;
-    mrs_unlock(&free_shadow_descs_lock);
-  } else {
-    mrs_unlock(&free_shadow_descs_lock);
-
-    mrs_debug_printf("alloc_shadow_desc: mapping new memory\n");
-    struct mrs_shadow_desc *new_descs = (struct mrs_shadow_desc *)real_mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_shadow_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
-    if (new_descs == MAP_FAILED) {
-      return NULL;
-    }
-    for (int i = 0; i < NEW_DESCRIPTOR_BATCH_SIZE - 2; i++) {
-      new_descs[i].next = &new_descs[i + 1];
-    }
-    ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
-    mrs_lock(&free_shadow_descs_lock);
-    new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = free_shadow_descs;
-    free_shadow_descs = new_descs;
-    mrs_unlock(&free_shadow_descs_lock);
-  }
-
-  ret->mmap_region = mmap_region;
-  ret->shadow = shadow;
-  return ret;
-}
-
-static vaddr_t mrs_shadow_desc_cmp(struct mrs_shadow_desc *e1, struct mrs_shadow_desc *e2) {
-  return cheri_getbase(e1->mmap_region) - cheri_getbase(e2->mmap_region);
-}
-
-RB_PROTOTYPE_STATIC(mrs_shadow_desc_head, mrs_shadow_desc, linkage, mrs_shadow_desc_cmp);
-RB_GENERATE_STATIC(mrs_shadow_desc_head, mrs_shadow_desc, linkage, mrs_shadow_desc_cmp);
-
-static struct mrs_shadow_desc *add_shadow_desc(struct mrs_shadow_desc *add) {
-  return RB_INSERT(mrs_shadow_desc_head, &shadow_spaces, add);
-}
-
-static struct mrs_shadow_desc *remove_shadow_desc(struct mrs_shadow_desc *rem) {
-  return RB_REMOVE(mrs_shadow_desc_head, &shadow_spaces, rem);
-}
-
-static struct mrs_shadow_desc *lookup_shadow_desc_by_mmap(void *mmap_region) {
-  struct mrs_shadow_desc lookup = {0};
-  lookup.mmap_region = mmap_region;
-  return RB_FIND(mrs_shadow_desc_head, &shadow_spaces, &lookup);
-}
-
-static struct mrs_shadow_desc *lookup_shadow_desc_by_allocation(void *allocated_region) {
-  struct mrs_shadow_desc *iter = RB_ROOT(&shadow_spaces);
-  while (iter) {
-    if (cheri_getbase(allocated_region) < cheri_getbase(iter->mmap_region)) {
-      iter = RB_LEFT(iter, linkage);
-    } else if (cheri_testsubset(iter->mmap_region, allocated_region)) {
-      return iter;
-    } else {
-      iter = RB_RIGHT(iter, linkage);
-    }
-  }
-  return NULL;
-}
-
 /* alloc_desc utilities */
 
-struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shadow_desc *shadow_desc) {
+struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
   struct mrs_alloc_desc *ret;
   mrs_lock(&free_alloc_descs_lock);
   if (free_alloc_descs != NULL) {
@@ -396,11 +314,6 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shado
   }
 
   ret->allocated_region = allocated_region;
-  /* derive cap to allocated_region with VMMAP set so it won't be revoked */
-  void *offset = cheri_setoffset(shadow_desc->mmap_region, cheri_getbase(allocated_region) - cheri_getbase(shadow_desc->mmap_region));
-  ret->vmmap_cap = cheri_csetbounds(offset, cheri_getlen(allocated_region));
-  ret->shadow = shadow_desc->shadow;
-  ret->shadow_desc = shadow_desc;
   return ret;
 }
 
@@ -414,8 +327,6 @@ static void init(void) {
   _pthread_mutex_init_calloc_cb(&name, name ## _storage)
 
 initialize_lock(printf_lock);
-initialize_lock(shadow_spaces_lock);
-initialize_lock(free_shadow_descs_lock);
 initialize_lock(free_alloc_descs_lock);
 initialize_lock(quarantine_lock);
 initialize_lock(full_quarantine_lock);
@@ -467,6 +378,11 @@ initialize_lock(full_quarantine_lock);
     mrs_printf("error getting kernel counters\n");
     exit(7);
   }
+
+  if (caprevoke_entire_shadow_cap(&entire_shadow)) {
+    mrs_printf("error getting entire shadow cap\n");
+    exit(7);
+  }
 }
 
 #ifdef PRINT_STATS
@@ -483,62 +399,14 @@ void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset
   return real_mmap(addr, len, prot, flags, fd, offset);
 #endif /* JUST_INTERPOSE */
   mrs_debug_printf("mrs_mmap: called with addr %p len 0x%zx prot 0x%x flags 0x%x fd %d offset 0x%zx\n", addr, len, prot, flags, fd, offset);
-
-  void *mmap_region = real_mmap(addr, len, prot, flags, fd, offset);
-  if (mmap_region == MAP_FAILED) {
-    mrs_printf("mrs_mmap: error in mmap errno %d\n", errno);
-    return MAP_FAILED;
-  }
-
-  void *shadow;
-  if (caprevoke_shadow(CAPREVOKE_SHADOW_NOVMMAP, mmap_region, &shadow)) {
-    mrs_printf("mrs_mmap: error in caprevoke_shadow errno %d\n", errno);
-    return MAP_FAILED;
-  }
-
-  struct mrs_shadow_desc *add = alloc_shadow_desc(mmap_region, shadow);
-  if (add == NULL) {
-    real_munmap(mmap_region, cheri_getlen(mmap_region));
-    mrs_printf("mrs_mmap: error allocating shadow descriptor\n");
-    return MAP_FAILED;
-  }
-
-  mrs_lock(&shadow_spaces_lock);
-  if (add_shadow_desc(add)) {
-    mrs_unlock(&shadow_spaces_lock);
-    real_munmap(mmap_region, cheri_getlen(mmap_region));
-    mrs_printf("mrs_mmap: error inserting shadow descriptor\n");
-    mrs_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mmap_region, shadow);
-    return MAP_FAILED;
-  }
-  mrs_unlock(&shadow_spaces_lock);
-
-  mrs_debug_printf("mrs_mmap: mmap returned %p caprevoke_shadow returned %p\n", mmap_region, shadow);
-  return mmap_region;
+  return real_mmap(addr, len, prot, flags, fd, offset);
 }
 
 int mrs_munmap(void *addr, size_t len) {
 #ifdef JUST_INTERPOSE
     return real_munmap(addr, len);
 #endif /* JUST_INTERPOSE */
-
   mrs_debug_printf("mrs_munmap: called\n");
-
-  mrs_lock(&shadow_spaces_lock);
-  struct mrs_shadow_desc *rem = lookup_shadow_desc_by_mmap(addr);
-  if (rem == NULL) {
-    mrs_unlock(&shadow_spaces_lock);
-    mrs_printf("mrs_munmap: shadow space descriptor not present\n");
-    return -1;
-  }
-
-  if (remove_shadow_desc(rem) == NULL) {
-    mrs_unlock(&shadow_spaces_lock);
-    mrs_printf("mrs_munmap: error removing shadow space descriptor\n");
-    return -1;
-  }
-  mrs_unlock(&shadow_spaces_lock);
-
   return real_munmap(addr, len);
 }
 
@@ -618,13 +486,17 @@ void *mrs_malloc(size_t size) {
  * the bitmap at once (ensured by the full_quarantine_lock). if we switch to full multicore,
  * with each core painting, we wil need to use (at least part of) the non-raw
  * functions. we will also need to use different caprevoke() calls.
+ *
+ * XXX we now don't prevent double frees and may move to multicore - in this
+ * case need to think about bitmap safety
  */
 static void flush_full_quarantine() {
   struct mrs_alloc_desc *iter = full_quarantine;
 #if !defined(JUST_QUARANTINE)
   while (iter != NULL) {
     /*caprev_shadow_nomap_set(iter->shadow, iter->vmmap_cap, iter->allocated_region);*/
-    caprev_shadow_nomap_set_raw(iter->shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
+    mrs_printf("painting %zx size %zd\n",cheri_getbase(iter->allocated_region), cheri_getlen(iter->allocated_region));
+    caprev_shadow_nomap_set_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
     iter = iter->next;
   }
 #endif /* !JUST_QUARANTINE */
@@ -648,10 +520,11 @@ static void flush_full_quarantine() {
   while (iter != NULL) {
 #if !defined(JUST_QUARANTINE)
     /*caprev_shadow_nomap_clear(iter->shadow, iter->allocated_region);*/
-    caprev_shadow_nomap_clear_raw(iter->shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
+    caprev_shadow_nomap_clear_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
     atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
-    real_free(iter->vmmap_cap);
+    /* XXX now we don't have the vmmap capability again */
+    real_free(iter->allocated_region);
 #ifdef SANITIZE
     mrs_lock(&shadow_spaces_lock);
     iter->shadow_desc->allocations--;
@@ -730,17 +603,7 @@ void mrs_free(void *ptr) {
   }
 #endif /* BYPASS_QUARANTINE */
 
-  /* add the allocation descriptor to quarantine */
-  struct mrs_shadow_desc *shadow = lookup_shadow_desc_by_allocation(ptr);
-  /*
-   * XXX we could do the lookup when flushing quarantine, but this would allow
-   * the application to artificially inflate quarantine size. maybe not a big deal.
-   */
-  if (shadow == NULL) {
-    /* XXX call free even though invalid? */
-    return;
-  }
-  struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr, shadow);
+  struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr);
   mrs_lock(&quarantine_lock);
   alloc->next = quarantine;
   quarantine = alloc;
