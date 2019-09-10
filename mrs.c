@@ -404,13 +404,6 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, struct mrs_shado
   return ret;
 }
 
-void free_alloc_desc(struct mrs_alloc_desc *desc) {
-  mrs_lock(&free_alloc_descs_lock);
-  desc->next = free_alloc_descs;
-  free_alloc_descs = desc;
-  mrs_unlock(&free_alloc_descs_lock);
-}
-
 /* initialization */
 __attribute__((constructor))
 static void init(void) {
@@ -713,7 +706,6 @@ void mrs_free(void *ptr) {
 
 #ifdef JUST_BOOKKEEPING
   real_free(ptr);
-  free_alloc_desc(ptr);
   return;
 #endif /* JUST_BOOKKEEPING */
 
