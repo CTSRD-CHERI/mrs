@@ -28,6 +28,12 @@
  * SUCH DAMAGE.
  */
 
+#ifdef MALLOC_PREFIX
+#define mmap(addr, len, prot, flags, fd, offset) mrs_mmap(addr, len, prot, flags, fd, offset)
+#define munmap(addr, len) mrs_munmap(addr, len)
+#define madvise(addr, len, behav) mrs_madvise(addr, len, behav)
+#endif
+
 void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
 int mrs_munmap(void *addr, size_t len);
 int mrs_madvise(void *addr, size_t len, int behav);

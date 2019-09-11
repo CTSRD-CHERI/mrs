@@ -1,10 +1,10 @@
 src/pages.c:
-- include mrs header (1 line)
-- replace mmap calls with mrs_mmap calls (3 lines, automatable)
-- replace munmap call with mrs_munmap call (1 line, not necessary, automatable)
-- replace madvise call with mrs_madvise call (7 lines, not necessary,
-  automatable)
-* preprocessor defs to do mrs replacements take up 5 lines
+- include mrs header (1 line), which does the following:
+  - replace mmap calls with mrs_mmap calls (3 lines)
+  - replace munmap call with mrs_munmap call (1 line)
+  - replace madvise call with mrs_madvise call (7 lines)
+  * preprocessor defs to do mrs replacements take up 5 lines
+  * not all of these changes are necessary for reduced bookkeeping shims
 
 include/size_classes.h:
 - change minimum alignment for TINY allocations to 16 bytes (1 line)

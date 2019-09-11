@@ -12,12 +12,6 @@
  * }
  * CHERI CHANGES END
  */
-#ifdef MALLOC_PREFIX
-#define mmap(addr, len, prot, flags, fd, offset) mrs_mmap(addr, len, prot, flags, fd, offset)
-#define munmap(addr, len) mrs_munmap(addr, len)
-#define madvise(addr, len, behav) mrs_madvise(addr, len, behav)
-#endif
-
 #define JEMALLOC_PAGES_C_
 #include "jemalloc/internal/jemalloc_preamble.h"
 
