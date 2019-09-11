@@ -36,20 +36,28 @@
 #include <assert.h>
 #include <cheri/cheric.h>
 
+void assert_not_revoked(void *cap) {
+  assert(cheri_getperm(cap) != 0);
+}
+
+void assert_revoked(void *cap) {
+  assert(cheri_getperm(cap) == 0);
+}
+
 /* expects revocation to happen immediately (no quarantine, no offload) */
 void uaf_basic_sub16() {
   void * volatile buffer = malloc(1);
-  assert(cheri_gettag(buffer));
+  assert_not_revoked(buffer);
   free(buffer);
-  assert(!cheri_gettag(buffer));
+  assert_revoked(buffer);
 }
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
 void uaf_basic_16() {
   void * volatile buffer = malloc(16);
-  assert(cheri_gettag(buffer));
+  assert_not_revoked(buffer);
   free(buffer);
-  assert(!cheri_gettag(buffer));
+  assert_revoked(buffer);
 }
 
 /* should trigger debug statements */
@@ -63,35 +71,35 @@ void free_pages() {
 /* expects revocation not to happen (doesn't fill quarantine) */
 void uaf_low_water() {
   void * volatile buffer = malloc(1);
-  assert(cheri_gettag(buffer));
+  assert_not_revoked(buffer);
   free(buffer);
-  assert(cheri_gettag(buffer));
+  assert_not_revoked(buffer);
 }
 
 /* expects revocation to happen (fills quarantine of size 1024, no offload) */
 void uaf_high_water() {
   void * volatile buffer1 = malloc(1);
-  assert(cheri_gettag(buffer1));
+  assert_not_revoked(buffer1);
   free(buffer1);
-  assert(cheri_gettag(buffer1));
+  assert_not_revoked(buffer1);
   void * volatile buffer2 = malloc(1024);
-  assert(cheri_gettag(buffer2));
+  assert_not_revoked(buffer2);
   free(buffer2);
-  assert(!cheri_gettag(buffer2));
+  assert_revoked(buffer2);
 }
 
 /* expects revocation to be offloaded (fills quarantine of size 1024, waits for it to work) */
 void uaf_high_water_offload() {
   void * volatile buffer1 = malloc(1);
-  assert(cheri_gettag(buffer1));
+  assert_not_revoked(buffer1);
   free(buffer1);
-  assert(cheri_gettag(buffer1));
-  void *volatile buffer2 = malloc(1024);
-  assert(cheri_gettag(buffer2));
+  assert_not_revoked(buffer1);
+  void * volatile buffer2 = malloc(1024);
+  assert_not_revoked(buffer2);
   free(buffer2);
-  assert(cheri_gettag(buffer2));
+  assert_not_revoked(buffer2);
   sleep(1);
-  assert(!cheri_gettag(buffer2));
+  assert_revoked(buffer2);
 }
 
 /* basic stress test with many mallocs and frees */
@@ -108,7 +116,6 @@ void basic_stress_test(int num_allocs) {
   }
   free((void * volatile)allocs);
 }
-
 
 int main(int argc, char *argv[]) {
   printf("mrs test start\n");
