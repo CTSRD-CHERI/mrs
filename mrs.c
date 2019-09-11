@@ -203,6 +203,8 @@ struct mrs_alloc_desc {
   RB_ENTRY(mrs_alloc_desc) linkage;
 };
 
+volatile const struct caprevoke_info *cri;
+
 static size_t page_size;
 /* alignment requirement for allocations so they can be painted in the caprevoke bitmap */
 static const size_t CAPREVOKE_BITMAP_ALIGNMENT = 16;
@@ -478,6 +480,12 @@ initialize_lock(full_quarantine_lock);
     mrs_printf("page_size not power of 2\n");
     exit(7);
   }
+
+  int res = caprevoke_shadow(CAPREVOKE_SHADOW_INFO_STRUCT, NULL, (void **)&cri);
+  if (res != 0) {
+    mrs_printf("error getting kernel counters\n");
+    exit(7);
+  }
 }
 
 #ifdef PRINT_STATS
@@ -686,8 +694,12 @@ static void flush_full_quarantine() {
 #endif /* !JUST_QUARANTINE */
 
 #if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
+  atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
+  caprevoke_epoch start_epoch = cri->epoch_enqueue;
   struct caprevoke_stats crst;
-  caprevoke(CAPREVOKE_LAST_PASS|CAPREVOKE_IGNORE_START, 0, &crst);
+  while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
+    caprevoke(CAPREVOKE_LAST_PASS, start_epoch, &crst);
+  }
 #endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
 
   struct mrs_alloc_desc *prev;
@@ -696,6 +708,7 @@ static void flush_full_quarantine() {
 #if !defined(JUST_QUARANTINE)
     /*caprev_shadow_nomap_clear(iter->shadow, iter->allocated_region);*/
     caprev_shadow_nomap_clear_raw(iter->shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
+    atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
     real_free(iter->vmmap_cap);
 #ifdef SANITIZE
