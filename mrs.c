@@ -495,7 +495,6 @@ static void flush_full_quarantine() {
 #if !defined(JUST_QUARANTINE)
   while (iter != NULL) {
     /*caprev_shadow_nomap_set(iter->shadow, iter->vmmap_cap, iter->allocated_region);*/
-    mrs_printf("painting %zx size %zd\n",cheri_getbase(iter->allocated_region), cheri_getlen(iter->allocated_region));
     caprev_shadow_nomap_set_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
     iter = iter->next;
   }
