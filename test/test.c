@@ -35,13 +35,14 @@
 #include <unistd.h>
 #include <assert.h>
 #include <cheri/cheric.h>
+#include <sys/caprevoke.h>
 
 void assert_not_revoked(void *cap) {
-  assert(cheri_getperm(cap) != 0);
+  assert(!caprevoke_is_revoked(cap));
 }
 
 void assert_revoked(void *cap) {
-  assert(cheri_getperm(cap) == 0);
+  assert(caprevoke_is_revoked(cap));
 }
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
@@ -114,7 +115,7 @@ void basic_stress_test(int num_allocs) {
     free(allocs[i - 1]);
     i--;
   }
-  free((void * volatile)allocs);
+  free((void *)allocs);
 }
 
 int main(int argc, char *argv[]) {
