@@ -91,6 +91,7 @@
  * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
  * SANITIZE: perform sanitization on mrs function calls, TODO? exit when desired property violated
+ * LOCKS: make mrs thread safe with locks
  *
  * JUST_INTERPOSE: just call the real functions
  * JUST_BOOKKEEPING: just update data structures then call the real functions
@@ -236,6 +237,7 @@ static int (*real_munmap) (void *, size_t);
 static int (*real_madvise) (void *, size_t, int);
 static int (*real_posix_madvise) (void *, size_t, int);
 
+#ifdef LOCKS
 /* locking */
 
 /*
@@ -268,6 +270,13 @@ pthread_cond_t full_quarantine_ready = PTHREAD_COND_INITIALIZER;
 
 #define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
 #define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
+
+#else /* LOCKS */
+
+#define mrs_lock(mtx)
+#define mrs_unlock(mtx)
+
+#endif /* !LOCKS */
 
 /* printf debugging */
 
@@ -428,6 +437,8 @@ static struct mrs_alloc_desc *lookup_alloc_desc(void *alloc) {
 /* initialization */
 __attribute__((constructor))
 static void init(void) {
+
+#ifdef LOCKS
 /* hack to initialize mutexes without calling malloc */
 #define initialize_lock(name) \
   _pthread_mutex_init_calloc_cb(&name, name ## _storage)
@@ -439,6 +450,7 @@ initialize_lock(allocations_lock);
 initialize_lock(free_alloc_descs_lock);
 initialize_lock(quarantine_lock);
 initialize_lock(full_quarantine_lock);
+#endif /* LOCKS */
 
 #if defined(STANDALONE)
   real_malloc = dlsym(RTLD_NEXT, "malloc");

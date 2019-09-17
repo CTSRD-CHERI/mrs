@@ -10,6 +10,7 @@ option(OFFLOAD_QUARANTINE "process the quarantine in a separate worker thread" O
 option(BYPASS_QUARANTINE "MADV_FREE freed page-size allocations" OFF)
 option(CLEAR_ALLOCATIONS "zero out allocations made by malloc" OFF)
 option(SANITIZE "behave more like a sanitizer" OFF)
+option(LOCKS "make mrs thread safe with locks" OFF)
 
 option(JUST_INTERPOSE "just call the real functions" OFF)
 option(JUST_BOOKKEEPING "just update data structures then call the real functions" OFF)
@@ -39,6 +40,10 @@ endif()
 if(SANITIZE)
   message("defining SANITIZE")
   add_compile_definitions(SANITIZE)
+endif()
+if(LOCKS)
+  message("defining LOCKS")
+  add_compile_definitions(LOCKS)
 endif()
 
 if(JUST_INTERPOSE)
