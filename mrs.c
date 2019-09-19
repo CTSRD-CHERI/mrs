@@ -140,6 +140,8 @@ void *mrs_realloc(void *, size_t);
 int mrs_posix_memalign(void **, size_t, size_t);
 void *mrs_aligned_alloc(size_t, size_t);
 
+static void *mrs_calloc_bootstrap(size_t number, size_t size);
+
 void *malloc(size_t size) {
   return mrs_malloc(size);
 }
@@ -209,9 +211,10 @@ static size_t max_quarantine_size;
 static struct mrs_alloc_desc *quarantine;
 static struct mrs_alloc_desc *full_quarantine;
 
+
 static void *(*real_malloc) (size_t);
 static void (*real_free) (void *);
-static void *(*real_calloc) (size_t, size_t);
+static void *(*real_calloc) (size_t, size_t) = mrs_calloc_bootstrap; /* replaced on init */
 static void *(*real_realloc) (void *, size_t);
 static int (*real_posix_memalign) (void **, size_t, size_t);
 static void *(*real_aligned_alloc) (size_t, size_t);
@@ -660,22 +663,25 @@ void mrs_free(void *ptr) {
 }
 
 /*
- * calloc is used to bootstrap the thread library; it is called before the
- * constructor function of this library to allocate a thread and sleep queue.
- * we serve these allocations statically to avoid issues during bootstrap.
- * later calls to calloc will take place after init() so locking will work.
+ * calloc is used to bootstrap the thread library and others like libc++; it is
+ * called before even the constructor function of this mrs library. before the
+ * initializer is called and real_calloc is set appropriately, use this
+ * bootstrap function to serve allocations. XXX these may get freed
  */
-void *mrs_calloc(size_t number, size_t size) {
-  static int count = 0;
-  static char thread[1968] __attribute__((aligned(16))) = {0}; //1968 sizeof struct pthread in libthr/thread/thr_private.h
-  static char sleep_queue[128] __attribute__((aligned(16))) = {0}; //128 sizeof struct sleepqueue in libthr/thread/thr_private.h
-  if (count == 0) {
-    count++;
-    return thread;
-  } else if (count == 1) {
-    count++;
-    return sleep_queue;
+static void *mrs_calloc_bootstrap(size_t number, size_t size) {
+#define BOOTSTRAP_CALLOC_SIZE 1024L * 1024 * 4
+  static char mem[BOOTSTRAP_CALLOC_SIZE] __attribute((aligned(16))) = {0};
+  static size_t offset = 0;
+
+  size_t old_offset = offset;
+  offset += (number * size);
+  if (offset > BOOTSTRAP_CALLOC_SIZE) {
+    exit(7);
   }
+  return &mem[old_offset];
+}
+
+void *mrs_calloc(size_t number, size_t size) {
 #ifdef JUST_INTERPOSE
     return real_calloc(number, size);
 #endif /* JUST_INTERPOSE */
