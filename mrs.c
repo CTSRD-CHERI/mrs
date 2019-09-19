@@ -45,7 +45,6 @@
 #include <string.h>
 
 #include "printf.h"
-#include "mrs.h"
 
 // use mrs on a cheri-enabled system to make a legacy memory allocator that has
 // been ported to purecap (1) immune to use-after-reallocation vulnerabilities
@@ -160,20 +159,6 @@ int posix_memalign(void **ptr, size_t alignment, size_t size) {
 void *aligned_alloc(size_t alignment, size_t size) {
   return mrs_aligned_alloc(alignment, size);
 }
-#ifdef STANDALONE
-void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
-  return mrs_mmap(addr, len, prot, flags, fd, offset);
-}
-int munmap(void *addr, size_t len) {
-  return mrs_munmap(addr, len);
-}
-int madvise(void *addr, size_t len, int behav) {
-  return mrs_madvise(addr, len, behav);
-}
-int posix_madvise(void *addr, size_t len, int behav) {
-  return mrs_posix_madvise(addr, len, behav);
-}
-#endif /* STANDALONE */
 
 #ifdef MALLOC_PREFIX
 void *concat(MALLOC_PREFIX,_malloc)(size_t size);
@@ -218,11 +203,6 @@ static void *(*real_calloc) (size_t, size_t) = mrs_calloc_bootstrap; /* replaced
 static void *(*real_realloc) (void *, size_t);
 static int (*real_posix_memalign) (void **, size_t, size_t);
 static void *(*real_aligned_alloc) (size_t, size_t);
-
-static void *(*real_mmap) (void *, size_t, int, int, int, off_t);
-static int (*real_munmap) (void *, size_t);
-static int (*real_madvise) (void *, size_t, int);
-static int (*real_posix_madvise) (void *, size_t, int);
 
 #ifdef LOCKS
 /* locking */
@@ -302,7 +282,7 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
     mrs_unlock(&free_alloc_descs_lock);
 
     mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
-    struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)real_mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
+    struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
     if (new_descs == MAP_FAILED) {
       return NULL;
     }
@@ -342,10 +322,6 @@ initialize_lock(full_quarantine_lock);
   real_realloc = dlsym(RTLD_NEXT, "realloc");
   real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
   real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
-  real_mmap = dlsym(RTLD_NEXT, "mmap");
-  real_munmap = dlsym(RTLD_NEXT, "munmap");
-  real_madvise = dlsym(RTLD_NEXT, "madvise");
-  real_posix_madvise = dlsym(RTLD_NEXT, "posix_madvise");
 #elif /* STANDALONE */ defined(MALLOC_PREFIX)
   real_malloc = concat(MALLOC_PREFIX, _malloc);
   real_free = concat(MALLOC_PREFIX, _free);
@@ -353,10 +329,6 @@ initialize_lock(full_quarantine_lock);
   real_realloc = concat(MALLOC_PREFIX, _realloc);
   real_posix_memalign = concat(MALLOC_PREFIX, _posix_memalign);
   real_aligned_alloc = concat(MALLOC_PREFIX, _aligned_alloc);
-  real_mmap = mmap;
-  real_munmap = munmap;
-  real_madvise = madvise;
-  real_posix_madvise = posix_madvise;
 #else /* !STANDALONE && MALLOC_PREFIX */
 #error must build mrs with either STANDALONE or MALLOC_PREFIX defined
 #endif /* !(STANDALONE || MALLOC_PREFIX) */
@@ -396,40 +368,6 @@ static void fini(void) {
 #endif /* PRINT_STATS */
 
 /* mrs functions */
-
-void *mrs_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
-#ifdef JUST_INTERPOSE
-  return real_mmap(addr, len, prot, flags, fd, offset);
-#endif /* JUST_INTERPOSE */
-  mrs_debug_printf("mrs_mmap: called with addr %p len 0x%zx prot 0x%x flags 0x%x fd %d offset 0x%zx\n", addr, len, prot, flags, fd, offset);
-  return real_mmap(addr, len, prot, flags, fd, offset);
-}
-
-int mrs_munmap(void *addr, size_t len) {
-#ifdef JUST_INTERPOSE
-    return real_munmap(addr, len);
-#endif /* JUST_INTERPOSE */
-  mrs_debug_printf("mrs_munmap: called\n");
-  return real_munmap(addr, len);
-}
-
-/* TODO write these */
-int mrs_madvise(void *addr, size_t len, int behav) {
-#ifdef JUST_INTERPOSE
-    return real_madvise(addr, len, behav);
-#endif /* JUST_INTERPOSE */
-
-  mrs_debug_printf("mrs_madvise: called behav %d\n", behav);
-  return real_madvise(addr, len, behav);
-}
-int mrs_posix_madvise(void *addr, size_t len, int behav) {
-#ifdef JUST_INTERPOSE
-    return real_posix_madvise(addr, len, behav);
-#endif /* JUST_INTERPOSE */
-
-  mrs_debug_printf("mrs_posix_madvise: called\n");
-  return real_posix_madvise(addr, len, behav);
-}
 
 void *mrs_malloc(size_t size) {
 #ifdef JUST_INTERPOSE
