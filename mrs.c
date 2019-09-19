@@ -710,7 +710,7 @@ static void flush_full_quarantine() {
   caprevoke_epoch start_epoch = cri->epoch_enqueue;
   struct caprevoke_stats crst;
   while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
-    caprevoke(CAPREVOKE_LAST_PASS, start_epoch, &crst);
+    caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
   }
 #endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
 
