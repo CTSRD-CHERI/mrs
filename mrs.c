@@ -92,6 +92,7 @@
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
  * SANITIZE: perform sanitization on mrs function calls, TODO? exit when desired property violated
  * LOCKS: make mrs thread safe with locks
+ * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
  *
  * JUST_INTERPOSE: just call the real functions
  * JUST_BOOKKEEPING: just update data structures then call the real functions
@@ -709,8 +710,13 @@ static void flush_full_quarantine() {
   atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
   caprevoke_epoch start_epoch = cri->epoch_enqueue;
   struct caprevoke_stats crst;
+#ifdef CONCURRENT_REVOCATION_PASS
+  const int MRS_CAPREVOKE_FLAGS = CAPREVOKE_LAST_PASS;
+#else /* CONCURRENT_REVOCATION_PASS */
+  const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
+#endif
   while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
-    caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
+    caprevoke(MRS_CAPREVOKE_FLAGS, start_epoch, &crst);
   }
 #endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
 
