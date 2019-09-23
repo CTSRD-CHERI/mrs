@@ -402,12 +402,16 @@ void *mrs_malloc(size_t size) {
      * pointer in the allocation and thus the alignment is guaranteed by malloc).
      */
     allocated_region = real_malloc(size);
+    if (allocated_region == NULL) {
+      return allocated_region;
+    }
   }
 
-  if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_malloc: alignment failure\n");
-    exit(7);
-  }
+  /* allocators can implement alignment incorrectly, doesn't allow UAF but may fault */
+  /*if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {*/
+    /*mrs_printf("mrs_malloc: alignment failure\n");*/
+    /*exit(7);*/
+  /*}*/
 
 #ifdef CLEAR_ALLOCATIONS
   memset(allocated_region, 0, cheri_getlen(allocated_region));
@@ -667,15 +671,19 @@ void *mrs_calloc(size_t number, size_t size) {
      * pointer in the allocation and thus the alignment is guaranteed by calloc).
      */
     allocated_region = real_calloc(number, size);
+    if (allocated_region == NULL) {
+      return allocated_region;
+    }
   }
 
-  if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_calloc: alignment failure\n");
-    exit(7);
-  }
+  /* allocators can implement alignment incorrectly, doesn't allow UAF but may fault */
+  /*if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {*/
+    /*mrs_printf("mrs_calloc: alignment failure\n");*/
+    /*exit(7);*/
+  /*}*/
 
   allocated_size += size;
-  if (allocated_size> max_allocated_size) {
+  if (allocated_size > max_allocated_size) {
     max_allocated_size = allocated_size;
   }
 
@@ -694,7 +702,8 @@ void *mrs_realloc(void *ptr, size_t size) {
     return real_realloc(ptr, size);
 #endif /* JUST_INTERPOSE */
 
-  mrs_debug_printf("mrs_realloc: called ptr %p ptr size %zu new size %zu\n", ptr, cheri_getlen(ptr), size);
+  size_t old_size = cheri_getlen(ptr);
+  mrs_debug_printf("mrs_realloc: called ptr %p ptr size %zu new size %zu\n", ptr, old_size, size);
 
   if (size == 0) {
     mrs_free(ptr);
@@ -710,26 +719,54 @@ void *mrs_realloc(void *ptr, size_t size) {
   if (new_alloc == NULL) {
     return NULL;
   }
-  size_t old_size = cheri_getlen(ptr);
   memcpy(new_alloc, ptr, size < old_size ? size : old_size);
   mrs_free(ptr);
   return new_alloc;
 }
 
-/* TODO write these */
 int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
 #ifdef JUST_INTERPOSE
     return real_posix_memalign(ptr, alignment, size);
 #endif /* JUST_INTERPOSE */
 
-  mrs_printf("mrs_posix_memalign: called\n");
-  return real_posix_memalign(ptr, alignment, size);
+  mrs_debug_printf("mrs_posix_memalign: called ptr %p alignment %zu size %zu\n", ptr, alignment, size);
+
+  if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
+    alignment = CAPREVOKE_BITMAP_ALIGNMENT;
+  }
+
+  int ret = real_posix_memalign(ptr, alignment, size);
+  if (ret != 0) {
+    return ret;
+  }
+
+  allocated_size += size;
+  if (allocated_size > max_allocated_size) {
+    max_allocated_size = allocated_size;
+  }
+
+  return ret;
 }
 void *mrs_aligned_alloc(size_t alignment, size_t size) {
 #ifdef JUST_INTERPOSE
     return real_aligned_alloc(alignment, size);
 #endif /* JUST_INTERPOSE */
 
-  mrs_printf("mrs_aligned_alloc: called\n");
+  mrs_debug_printf("mrs_aligned_alloc: called alignment %zu size %zu\n", alignment, size);
+
+  if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
+    alignment = CAPREVOKE_BITMAP_ALIGNMENT;
+  }
+
+  void *ret = real_aligned_alloc(alignment, size);
+  if (ret == NULL) {
+   return ret;
+  }
+
+  allocated_size += size;
+  if (allocated_size > max_allocated_size) {
+    max_allocated_size = allocated_size;
+  }
+
   return real_aligned_alloc(alignment, size);
 }
