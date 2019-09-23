@@ -513,7 +513,7 @@ void mrs_free(void *ptr) {
 
   mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
-  if (ptr == NULL) {
+  if (ptr == NULL || caprevoke_is_revoked(ptr)) {
     return;
   }
 
