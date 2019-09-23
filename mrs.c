@@ -39,6 +39,7 @@
 #include <sys/mman.h>
 #include <sys/tree.h>
 #include <sys/caprevoke.h>
+#include <machine/vmparam.h>
 #include <cheri/caprevoke.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -181,7 +182,7 @@ volatile const struct caprevoke_info *cri;
 
 static size_t page_size;
 /* alignment requirement for allocations so they can be painted in the caprevoke bitmap */
-static const size_t CAPREVOKE_BITMAP_ALIGNMENT = 16;
+static const size_t CAPREVOKE_BITMAP_ALIGNMENT = sizeof(void *); // TODO VM_CAPREVOKE_GSZ_MEM_NOMAP from machine/vmparam.h
 static const size_t NEW_DESCRIPTOR_BATCH_SIZE = 10000;
 static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
@@ -380,32 +381,33 @@ void *mrs_malloc(size_t size) {
     return NULL;
   }
 
-#ifdef STANDALONE
+  void *allocated_region;
+
   /*
-   * can't control alignment behavior, so make sure all allocations are aligned
-   * for bitmap painting by increasing the size.
+   * ensure that all allocations less than the shadow bitmap granule size are
+   * aligned to that granule size, so that no two allocations will be governed
+   * by the same shadow bit.
    */
   if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
-    mrs_printf("mrs_malloc: size under caprevoke alignment, increasing size\n");
-    size = CAPREVOKE_BITMAP_ALIGNMENT;
+    /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
+    if (real_posix_memalign(&allocated_region, CAPREVOKE_BITMAP_ALIGNMENT, size)) {
+      mrs_printf("mrs_malloc: error aligning allocation of size less than the shadow bitmap granule\n");
+      return NULL;
+    }
+  } else {
+    /*
+     * currently, sizeof(void *) == CAPREVOKE_BITMAP_ALIGNMENT == 16, which means
+     * that if size >= CAPREVOKE_BITMAP_ALIGNMENT it should be aligned to a
+     * multiple of CAPREVOKE_BITMAP_ALIGNMENT (because it is possible to store a
+     * pointer in the allocation and thus the alignment is guaranteed by malloc).
+     */
+    allocated_region = real_malloc(size);
   }
-#endif /* STANDALONE */
 
-  void *allocated_region = real_malloc(size);
-
-#ifdef MALLOC_PREFIX
-  if ((cheri_getbase(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_malloc: caprevoke bitmap alignment violated\n");
+  if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
+    mrs_printf("mrs_malloc: alignment failure\n");
     exit(7);
   }
-#endif /* MALLOC_PREFIX */
-
-#ifdef SANITIZE
-  if ((cheri_getlen(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_malloc: caprevoke bitmap size requirement violated, %zu\n", cheri_getlen(allocated_region));
-    exit(7);
-  }
-#endif /* SANITIZE */
 
 #ifdef CLEAR_ALLOCATIONS
   memset(allocated_region, 0, cheri_getlen(allocated_region));
@@ -422,14 +424,20 @@ void *mrs_malloc(size_t size) {
 }
 
 /*
- * currently, we can use the raw version of bitmap painting functions because we have data
- * structure synchronization that prevents double-frees and only one thread will be painting
- * the bitmap at once (ensured by the full_quarantine_lock). if we switch to full multicore,
- * with each core painting, we wil need to use (at least part of) the non-raw
- * functions. we will also need to use different caprevoke() calls.
+ * the raw version of bitmap painting is sufficient in the single-threaded and
+ * multi-threaded-with-locks cases. however, in the lockless multithreaded
+ * case, we need to atomically check that the capability has not already been
+ * revoked as we paint the bitmap. if we didn't do this atomically, a
+ * revocation pass might happen between when a thread checks that the
+ * capability has not been revoked and when it paints the bitmap, which would
+ * result in the bitmap being painted in an improper epoch.
  *
- * XXX we now don't prevent double frees and may move to multicore - in this
- * case need to think about bitmap safety
+ * note that none of the SPEC benchmarks are multithreaded, and when we do
+ * revocation offload only the offload thread actually paints the bitmap.
+ *
+ * even without this check in the lockless multithreaded case, the result of
+ * the bitmap being painted in an improper epoch would be a fault rather than
+ * heap objects aliasing, which is not so bad.
  */
 static void flush_full_quarantine() {
   struct mrs_alloc_desc *iter = full_quarantine;
@@ -463,7 +471,7 @@ static void flush_full_quarantine() {
     caprev_shadow_nomap_clear_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
     atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
-    /* XXX now we don't have the vmmap capability again */
+    /* this will be a revoked capability, which the allocator must accept */
     real_free(iter->allocated_region);
 #ifdef SANITIZE
     mrs_lock(&shadow_spaces_lock);
@@ -513,6 +521,10 @@ void mrs_free(void *ptr) {
 
   mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
+  /*
+   * short-circuit if ptr has been revoked. if multiple threads, this should be
+   * checked atomically as the bitmap is painted.
+   */
   if (ptr == NULL || caprevoke_is_revoked(ptr)) {
     return;
   }
@@ -532,6 +544,8 @@ void mrs_free(void *ptr) {
    * XXX munmap with MAP_GUARD more expensive but would cause trap on access
    *
    * TODO maybe coalesce in quarantine? can't reduce free calls unless we get a full page
+   *
+   * XXX can't use mmap family in slimmed-down shim layer
    */
   vaddr_t base = cheri_getbase(ptr);
   size_t region_size = cheri_getlen(ptr);
@@ -614,6 +628,7 @@ static void *mrs_calloc_bootstrap(size_t number, size_t size) {
   size_t old_offset = offset;
   offset += (number * size);
   if (offset > BOOTSTRAP_CALLOC_SIZE) {
+    mrs_printf("mrs_calloc_bootstrap: ran out of memory\n");
     exit(7);
   }
   return &mem[old_offset];
@@ -624,41 +639,40 @@ void *mrs_calloc(size_t number, size_t size) {
     return real_calloc(number, size);
 #endif /* JUST_INTERPOSE */
 
-
   /*mrs_debug_printf("mrs_calloc: called\n");*/
 
   if (number == 0 || size == 0) {
     return NULL;
   }
 
-#ifdef STANDALONE
+  void *allocated_region;
+
   /*
-   * can't control alignment behavior, so make sure all allocations are aligned
-   * for bitmap painting by increasing the size.
+   * ensure that all allocations less than the shadow bitmap granule size are
+   * aligned to that granule size, so that no two allocations will be governed
+   * by the same shadow bit.
    */
-  if ((number * size) < CAPREVOKE_BITMAP_ALIGNMENT) {
-    mrs_printf("mrs_calloc: size under caprevoke alignment, increasing size\n");
-    size = CAPREVOKE_BITMAP_ALIGNMENT;
+  if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
+    /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
+    if (real_posix_memalign(&allocated_region, CAPREVOKE_BITMAP_ALIGNMENT, number * size)) {
+      mrs_printf("mrs_calloc: error aligning allocation of size less than the shadow bitmap granule\n");
+      return NULL;
+    }
+    memset(allocated_region, 0, cheri_getlen(allocated_region));
+  } else {
+    /*
+     * currently, sizeof(void *) == CAPREVOKE_BITMAP_ALIGNMENT == 16, which means
+     * that if size >= CAPREVOKE_BITMAP_ALIGNMENT it should be aligned to a
+     * multiple of CAPREVOKE_BITMAP_ALIGNMENT (because it is possible to store a
+     * pointer in the allocation and thus the alignment is guaranteed by calloc).
+     */
+    allocated_region = real_calloc(number, size);
   }
-#endif /* STANDALONE */
 
-  void *allocated_region = real_calloc(number, size);
-
-#ifdef MALLOC_PREFIX
-  if ((cheri_getbase(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_calloc: caprevoke bitmap alignment violated\n");
+  if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
+    mrs_printf("mrs_calloc: alignment failure\n");
     exit(7);
   }
-#endif /* MALLOC_PREFIX */
-
-#ifdef SANITIZE
-  if ((cheri_getlen(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {
-    mrs_printf("mrs_calloc: caprevoke bitmap size requirement violated, %zu\n", cheri_getlen(allocated_region));
-    exit(7);
-  }
-#endif /* SANITIZE */
-
-  /* TODO clear alloacation if SANITIZE? */
 
   allocated_size += size;
   if (allocated_size> max_allocated_size) {
