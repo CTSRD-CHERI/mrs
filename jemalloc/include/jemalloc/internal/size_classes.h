@@ -46,9 +46,9 @@
  */
 
 #define LG_SIZE_CLASS_GROUP	2
-//#define LG_TINY_MIN		3
-// XXX BFG changed to make the minimum alignment 16 for jemalloc (required for revocation)
-#define LG_TINY_MIN		4
+#define LG_TINY_MIN		3
+// XXX BFG changed LG_TINY_MIN from 3 to 4 to make the minimum alignment 16 for
+// jemalloc (required for old version of shim layer)
 
 #if (LG_SIZEOF_PTR == 2 && LG_TINY_MIN == 3 && LG_QUANTUM == 3 && LG_PAGE == 12)
 #define SIZE_CLASSES \
