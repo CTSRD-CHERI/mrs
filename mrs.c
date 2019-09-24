@@ -199,7 +199,6 @@ static size_t max_quarantine_size;
 static struct mrs_alloc_desc *quarantine;
 static struct mrs_alloc_desc *full_quarantine;
 
-
 static void *(*real_malloc) (size_t);
 static void (*real_free) (void *);
 static void *(*real_calloc) (size_t, size_t) = mrs_calloc_bootstrap; /* replaced on init */
@@ -207,55 +206,59 @@ static void *(*real_realloc) (void *, size_t);
 static int (*real_posix_memalign) (void **, size_t, size_t);
 static void *(*real_aligned_alloc) (size_t, size_t);
 
-#ifdef LOCKS
-/* locking */
+#if defined(DEBUG) || defined(OFFLOAD_QUARANTINE)
+/* locks */
+
+#define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
+#define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
 
 /*
  * hack to initialize mutexes without calling malloc. without this, locking
  * operations in allocation functions would cause an infinite loop. the buf
  * size should be at least sizeof(struct pthread_mutex) from thr_private.h
  */
-int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size_t, size_t));
 #define create_lock(name) \
   pthread_mutex_t name; \
   char name ## _buf[256] __attribute__((aligned(16))); \
   void *name ## _storage() { \
     return name ## _buf; \
   }
+int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size_t, size_t));
+#define initialize_lock(name) \
+  _pthread_mutex_init_calloc_cb(&name, name ## _storage)
 
-create_lock(printf_lock);
-create_lock(full_quarantine_lock);
-
-#ifdef OFFLOAD_QUARANTINE
-static void *full_quarantine_offload(void *);
-/* shouldn't need hack because condition variables are not used in allocation routines */
-pthread_cond_t full_quarantine_empty = PTHREAD_COND_INITIALIZER;
-pthread_cond_t full_quarantine_ready = PTHREAD_COND_INITIALIZER;
-#endif /* OFFLOAD_QUARANTINE */
-
-#define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
-#define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
-
-#else /* LOCKS */
+#else /* DEBUG || OFFLOAD_QUARANTINE */
 
 #define mrs_lock(mtx)
 #define mrs_unlock(mtx)
 
-#endif /* !LOCKS */
+#endif /* !DEBUG && !OFFLOAD_QUARANTINE */
 
-/* printf debugging */
+#ifdef OFFLOAD_QUARANTINE
+static void *full_quarantine_offload(void *);
+create_lock(full_quarantine_lock);
+/* no hack for these hack because condition variables are not used in allocation routines */
+pthread_cond_t full_quarantine_empty = PTHREAD_COND_INITIALIZER;
+pthread_cond_t full_quarantine_ready = PTHREAD_COND_INITIALIZER;
+#endif /* OFFLOAD_QUARANTINE */
+
+/* printf support - non-debug printf is not thread safe! */
 
 void _putchar(char character) {
   write(2, &character, sizeof(char));
 }
 
 #define mrs_printf(fmt, ...) \
-  do {mrs_lock(&printf_lock); printf(("mrs: " fmt), ##__VA_ARGS__); mrs_unlock(&printf_lock);} while (0)
+  do {printf(("mrs: " fmt), ##__VA_ARGS__);} while (0)
 
 #define mrs_printcap(name, cap) \
   mrs_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
 
+/* debugging */
+
 #ifdef DEBUG
+
+create_lock(printf_lock);
 
 #define mrs_debug_printf(fmt, ...) \
   mrs_printf(fmt, ##__VA_ARGS__)
@@ -337,14 +340,13 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
 __attribute__((constructor))
 static void init(void) {
 
-#ifdef LOCKS
-/* hack to initialize mutexes without calling malloc */
-#define initialize_lock(name) \
-  _pthread_mutex_init_calloc_cb(&name, name ## _storage)
-
+#ifdef DEBUG
 initialize_lock(printf_lock);
+#endif /* DEBUG */
+
+#ifdef OFFLOAD_QUARANTINE
 initialize_lock(full_quarantine_lock);
-#endif /* LOCKS */
+#endif /* OFFLOAD_QUARANTINE */
 
 #if defined(STANDALONE)
   real_malloc = dlsym(RTLD_NEXT, "malloc");
@@ -617,8 +619,8 @@ void mrs_free(void *ptr) {
   if (should_revoke) {
     mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
 
-    mrs_lock(&full_quarantine_lock);
 #ifdef OFFLOAD_QUARANTINE
+    mrs_lock(&full_quarantine_lock);
     while (full_quarantine != NULL) {
       mrs_debug_printf("mrs_free: waiting for full_quarantine to drain\n");
       if (pthread_cond_wait(&full_quarantine_empty, &full_quarantine_lock)) {
@@ -638,10 +640,10 @@ void mrs_free(void *ptr) {
         mrs_printf("pthread error\n");
         exit(7);
     }
+    mrs_unlock(&full_quarantine_lock);
 #else /* OFFLOAD_QUARANTINE */
     flush_full_quarantine();
 #endif /* !OFFLOAD_QUARANTINE */
-    mrs_unlock(&full_quarantine_lock);
   }
 }
 
