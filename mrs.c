@@ -28,58 +28,27 @@
  * SUCH DAMAGE.
  */
 
-#include <stddef.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <dlfcn.h>
-#include <cheri/cheric.h>
 #include <sys/types.h>
+#include <sys/caprevoke.h>
 #include <sys/mman.h>
 #include <sys/tree.h>
-#include <sys/caprevoke.h>
-#include <machine/vmparam.h>
+
 #include <cheri/caprevoke.h>
+#include <cheri/cheric.h>
+
+#include <machine/vmparam.h>
+
+#include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "printf.h"
-
-// use mrs on a cheri-enabled system to make a legacy memory allocator that has
-// been ported to purecap (1) immune to use-after-reallocation vulnerabilities
-// (2) immune to vulnerabilities related to double free, incorrect (arbitrary)
-// free, and exposure of allocator metadata. the allocator will already be
-// spatially safe by virtue of running purecap.
-
-// mrs can be built as a standalone shared library (#define STANDALONE) for use
-// with LD_PRELOAD over an existing allocator - in this case it exports the
-// malloc family and mmap fmaily symbols, and it gets the real ones from dlsym.
-
-// mrs can also be linked into an existing cherified malloc implmenetaion
-// (#define MALLOC_PREFIX <prefix>), in which case it exports only the malloc
-// family symbols. the existing malloc implementation should be modified to use
-// mrs_ prefixed versions of mmap family smybols, and its malloc and free
-// functions should be prefixed with the defined malloc prefix (e.g.
-// <prefix>_malloc) for mrs to consume.
-
-// underlying mallocs must give out 16-byte aligned memory for revocation to work.
-
-// TODO mrs may in the future export library functions that can be used to
-// convert a cherified malloc into one that is temporally safe without paying
-// all the performance costs of a shim layer.
-//
-// TODO mrs may in the future also have a more sophisticated quarantine with
-// multiple lists and coalescing and MAP_GUARDing. however even with coalescing
-// it is not possible to reduce the number of free() calls while using a shim
-// layer.
-//
-// TODO mrs may in the future have more sophisticated multicore support, where
-// each core has a copy of data structures used to validate allocations and
-// frees. in the common case, these data structures can be checked without
-// contention, and in case of a miss on one core it can check the others.
-// multicore revocation with separate quarantines can also be used.
 
 /*
  * Knobs:
@@ -103,27 +72,9 @@
  *
  */
 
-/*
- * baseline functionality is protection against use-after-reallocation attacks,
- * protection against use-after-free attacks caused by allocator reuse of freed
- * memory for metadata, and protection against double-free and arbitrary free
- * attacks (an allocated region, identified by the base of the capability that
- * points to it, can only be freed once; non-allocated regions cannot be
- * freed). also protects against duplicate allocations.
- *
- * sanitization is validating the size of capabilities passed to free, TODO
- * validating that pages will not be munmapped or madvise free'd while there
- * are still valid allocations on them, validating the size and permissions of
- * capabilities returned by the memory allocator, validating that regions from
- * malloc and mmap are non-overlapping, checking at exit how many allocations
- * are outstanding. these checks may be useful when running a legacy or
- * untrusted malloc, or to debug cherifying a malloc/make going from non-cheri
- * malloc to temporally safe malloc easy.
- */
+/* functions */
 
 #define cheri_testsubset(x, y) __builtin_cheri_subset_test((x), (y)) // TODO add to cheric.h
-
-/* function declarations and definitions */
 
 void *mrs_malloc(size_t);
 void mrs_free(void *);
@@ -155,13 +106,11 @@ void *aligned_alloc(size_t alignment, size_t size) {
 
 /* globals */
 
-/* store info about allocated region */
+// TODO investigate replacing with linked list of arrays
 struct mrs_alloc_desc {
   void *allocated_region;
   struct mrs_alloc_desc *next;
 };
-
-volatile const struct caprevoke_info *cri;
 
 static size_t page_size;
 /* alignment requirement for allocations so they can be painted in the caprevoke bitmap */
@@ -169,6 +118,7 @@ static const size_t CAPREVOKE_BITMAP_ALIGNMENT = sizeof(void *); // TODO VM_CAPR
 static const size_t NEW_DESCRIPTOR_BATCH_SIZE = 10000;
 static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
+volatile const struct caprevoke_info *cri;
 static void *entire_shadow;
 
 #ifndef OFFLOAD_QUARANTINE
@@ -177,10 +127,11 @@ static struct mrs_alloc_desc * free_alloc_descs;
 static struct mrs_alloc_desc * _Atomic free_alloc_descs;
 #endif /* OFFLOAD_QUARANTINE */
 
-static size_t allocated_size;
+static size_t allocated_size; /* amount of memory that the allocator views as allocated (includes quarantine) */
 static size_t max_allocated_size;
-static size_t quarantine_size;
+static size_t quarantine_size; /* amount of memory in quarantine */
 static size_t max_quarantine_size;
+
 static struct mrs_alloc_desc *quarantine;
 static struct mrs_alloc_desc *full_quarantine;
 
@@ -191,8 +142,9 @@ static void *(*real_realloc) (void *, size_t);
 static int (*real_posix_memalign) (void **, size_t, size_t);
 static void *(*real_aligned_alloc) (size_t, size_t);
 
-#if defined(DEBUG) || defined(OFFLOAD_QUARANTINE)
 /* locks */
+
+#if defined(DEBUG) || defined(OFFLOAD_QUARANTINE)
 
 #define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
 #define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
@@ -227,7 +179,7 @@ pthread_cond_t full_quarantine_empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t full_quarantine_ready = PTHREAD_COND_INITIALIZER;
 #endif /* OFFLOAD_QUARANTINE */
 
-/* printf support - non-debug printf is not thread safe! */
+/* printf support: not thread safe */
 
 void _putchar(char character) {
   write(2, &character, sizeof(char));
@@ -258,7 +210,7 @@ create_lock(printf_lock);
 
 #endif /* !DEBUG */
 
-/* alloc_desc utilities */
+/* utilities */
 
 static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
 
@@ -270,7 +222,6 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
     free_alloc_descs = free_alloc_descs->next;
 
   } else {
-
     mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
     struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
     if (new_descs == MAP_FAILED) {
@@ -292,7 +243,7 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
   struct mrs_alloc_desc *ret = free_alloc_descs;
 
   /*
-   * XXX this shoudl work even with additional consumers, which we don't have
+   * XXX this should work even with additional consumers, which we don't have
    * in practice. can move the if (ret == NULL) check out of the do-while.
    */
   do {
@@ -321,18 +272,10 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
 #endif /* OFFLOAD_QUARANTINE */
 }
 
-/* initialization */
+/* constructor and destructor */
+
 __attribute__((constructor))
 static void init(void) {
-
-#ifdef DEBUG
-initialize_lock(printf_lock);
-#endif /* DEBUG */
-
-#ifdef OFFLOAD_QUARANTINE
-initialize_lock(full_quarantine_lock);
-#endif /* OFFLOAD_QUARANTINE */
-
   real_malloc = dlsym(RTLD_NEXT, "malloc");
   real_free = dlsym(RTLD_NEXT, "free");
   real_calloc = dlsym(RTLD_NEXT, "calloc");
@@ -340,8 +283,13 @@ initialize_lock(full_quarantine_lock);
   real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
   real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
 
+#ifdef DEBUG
+  initialize_lock(printf_lock);
+#endif /* DEBUG */
+
 #ifdef OFFLOAD_QUARANTINE
-  /* spawn offload thread XXX in purecap spwaning this thread in init() causes main() not to be called */
+  initialize_lock(full_quarantine_lock);
+
   pthread_t thd;
   if (pthread_create(&thd, NULL, full_quarantine_offload, NULL)) {
     mrs_printf("pthread error\n");
@@ -351,13 +299,13 @@ initialize_lock(full_quarantine_lock);
 
   page_size = getpagesize();
   if ((page_size & (page_size - 1)) != 0) {
-    mrs_printf("page_size not power of 2\n");
+    mrs_printf("page_size not a power of 2\n");
     exit(7);
   }
 
   int res = caprevoke_shadow(CAPREVOKE_SHADOW_INFO_STRUCT, NULL, (void **)&cri);
   if (res != 0) {
-    mrs_printf("error getting kernel counters\n");
+    mrs_printf("error getting kernel caprevoke counters\n");
     exit(7);
   }
 
@@ -392,7 +340,8 @@ void *mrs_malloc(size_t size) {
   /*
    * ensure that all allocations less than the shadow bitmap granule size are
    * aligned to that granule size, so that no two allocations will be governed
-   * by the same shadow bit.
+   * by the same shadow bit. allocators may implement alignment incorrectly,
+   * this doesn't allow UAF bugs but may cause faults.
    */
   if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
     /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
@@ -413,12 +362,6 @@ void *mrs_malloc(size_t size) {
     }
   }
 
-  /* allocators can implement alignment incorrectly, doesn't allow UAF but may fault */
-  /*if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {*/
-    /*mrs_printf("mrs_malloc: alignment failure\n");*/
-    /*exit(7);*/
-  /*}*/
-
 #ifdef CLEAR_ALLOCATIONS
   memset(allocated_region, 0, cheri_getlen(allocated_region));
 #endif /* CLEAR_ALLOCATIONS */
@@ -432,6 +375,159 @@ void *mrs_malloc(size_t size) {
 
   return allocated_region;
 }
+
+/*
+ * calloc is used to bootstrap various system libraries so is called before
+ * even the constructor function of this library. before the initializer is
+ * called and real_calloc is set appropriately, use this bootstrap function to
+ * serve allocations.
+ */
+static void *mrs_calloc_bootstrap(size_t number, size_t size) {
+  const size_t BOOTSTRAP_CALLOC_SIZE = 1024 * 1024 * 4;
+  static char mem[BOOTSTRAP_CALLOC_SIZE] __attribute((aligned(16))) = {0};
+  static size_t offset = 0;
+
+  size_t old_offset = offset;
+  offset += (number * size);
+  if (offset > BOOTSTRAP_CALLOC_SIZE) {
+    mrs_printf("mrs_calloc_bootstrap: ran out of memory\n");
+    exit(7);
+  }
+  return &mem[old_offset];
+}
+
+void *mrs_calloc(size_t number, size_t size) {
+#ifdef JUST_INTERPOSE
+    return real_calloc(number, size);
+#endif /* JUST_INTERPOSE */
+
+  /*mrs_debug_printf("mrs_calloc: called\n");*/
+
+  if (number == 0 || size == 0) {
+    return NULL;
+  }
+
+  void *allocated_region;
+
+  /*
+   * ensure that all allocations less than the shadow bitmap granule size are
+   * aligned to that granule size, so that no two allocations will be governed
+   * by the same shadow bit. allocators may implement alignment incorrectly,
+   * this doesn't allow UAF bugs but may cause faults.
+   */
+  if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
+    /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
+    if (real_posix_memalign(&allocated_region, CAPREVOKE_BITMAP_ALIGNMENT, number * size)) {
+      mrs_debug_printf("mrs_calloc: error aligning allocation of size less than the shadow bitmap granule\n");
+      return NULL;
+    }
+    memset(allocated_region, 0, cheri_getlen(allocated_region));
+  } else {
+    /*
+     * currently, sizeof(void *) == CAPREVOKE_BITMAP_ALIGNMENT == 16, which means
+     * that if size >= CAPREVOKE_BITMAP_ALIGNMENT it should be aligned to a
+     * multiple of CAPREVOKE_BITMAP_ALIGNMENT (because it is possible to store a
+     * pointer in the allocation and thus the alignment is guaranteed by calloc).
+     */
+    allocated_region = real_calloc(number, size);
+    if (allocated_region == NULL) {
+      return allocated_region;
+    }
+  }
+
+  allocated_size += size;
+  if (allocated_size > max_allocated_size) {
+    max_allocated_size = allocated_size;
+  }
+
+  /* this causes problems if our library is initizlied before the thread library */
+  /*mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);*/
+
+  return allocated_region;
+}
+
+int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
+#ifdef JUST_INTERPOSE
+    return real_posix_memalign(ptr, alignment, size);
+#endif /* JUST_INTERPOSE */
+
+  mrs_debug_printf("mrs_posix_memalign: called ptr %p alignment %zu size %zu\n", ptr, alignment, size);
+
+  if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
+    alignment = CAPREVOKE_BITMAP_ALIGNMENT;
+  }
+
+  int ret = real_posix_memalign(ptr, alignment, size);
+  if (ret != 0) {
+    return ret;
+  }
+
+  allocated_size += size;
+  if (allocated_size > max_allocated_size) {
+    max_allocated_size = allocated_size;
+  }
+
+  return ret;
+}
+
+void *mrs_aligned_alloc(size_t alignment, size_t size) {
+#ifdef JUST_INTERPOSE
+    return real_aligned_alloc(alignment, size);
+#endif /* JUST_INTERPOSE */
+
+  mrs_debug_printf("mrs_aligned_alloc: called alignment %zu size %zu\n", alignment, size);
+
+  if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
+    alignment = CAPREVOKE_BITMAP_ALIGNMENT;
+  }
+
+  void *ret = real_aligned_alloc(alignment, size);
+  if (ret == NULL) {
+   return ret;
+  }
+
+  allocated_size += size;
+  if (allocated_size > max_allocated_size) {
+    max_allocated_size = allocated_size;
+  }
+
+  return ret;
+}
+
+/*
+ * replace realloc with a malloc and free to avoid dangling pointers in case of
+ * in-place realloc that shrinks the buffer. if ptr is not a real allocation,
+ * mrs_free() won't free it, but its buffer will still get copied into a new
+ * allocation.
+ */
+void *mrs_realloc(void *ptr, size_t size) {
+
+#ifdef JUST_INTERPOSE
+    return real_realloc(ptr, size);
+#endif /* JUST_INTERPOSE */
+
+  size_t old_size = cheri_getlen(ptr);
+  mrs_debug_printf("mrs_realloc: called ptr %p ptr size %zu new size %zu\n", ptr, old_size, size);
+
+  if (size == 0) {
+    mrs_free(ptr);
+    return NULL;
+  }
+
+  if (ptr == NULL) {
+    return mrs_malloc(size);
+  }
+
+  void *new_alloc = mrs_malloc(size);
+  /* old object is not deallocated according to the spec */
+  if (new_alloc == NULL) {
+    return NULL;
+  }
+  memcpy(new_alloc, ptr, size < old_size ? size : old_size);
+  mrs_free(ptr);
+  return new_alloc;
+}
+
 
 /*
  * the raw version of bitmap painting is sufficient in the single-threaded and
@@ -545,6 +641,11 @@ void mrs_free(void *ptr) {
   return;
 #endif /* JUST_BOOKKEEPING */
 
+  /* TODO XXX
+   * we can't trust the base and len that are provided by the caller here, we need to get the original allocation's
+   * capability from the allocator (or know if there isn't one)
+   */
+
 #ifdef BYPASS_QUARANTINE
   /*
    * if this is a full-page(s) allocation, bypass the quarantine by
@@ -552,18 +653,16 @@ void mrs_free(void *ptr) {
    * because we don't know allocator internals, the allocated size must
    * actually be a multiple of the page size.
    *
-   * XXX munmap with MAP_GUARD more expensive but would cause trap on access
-   *
-   * TODO maybe coalesce in quarantine? can't reduce free calls unless we get a full page
-   *
-   * XXX can't use mmap family in slimmed-down shim layer
+   * we can't actually do this in the slimmed-down shim layer because we don't
+   * have the vmmap-bearing capability. coalescing in quarntine is perhaps less
+   * useful to the shim because we may not know about allocator metadata.
    */
   vaddr_t base = cheri_getbase(ptr);
   size_t region_size = cheri_getlen(ptr);
   if (((base & (page_size - 1)) == 0) &&
       ((region_size & (page_size - 1)) == 0)) {
     mrs_debug_printf("mrs_free: page-multiple free, bypassing quarantine\n");
-    /*real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE); TODO need to lookup and rederive vmmap pointer*/
+    /*real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE);*/
     return;
   }
 #endif /* BYPASS_QUARANTINE */
@@ -571,6 +670,7 @@ void mrs_free(void *ptr) {
   struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr);
   alloc->next = quarantine;
   quarantine = alloc;
+
   quarantine_size += cheri_getlen(alloc->allocated_region);
   if (quarantine_size > max_quarantine_size) {
     max_quarantine_size = quarantine_size;
@@ -582,11 +682,11 @@ void mrs_free(void *ptr) {
   should_revoke = (quarantine_size >= QUARANTINE_HIGHWATER);
 #else /* QUARANTINE_HIGHWATER */
 
-#  if !defined(QUARANTINE_RATIO)
-#    define QUARANTINE_RATIO 4
-#  endif /* !QUARANTINE_RATIO */
+#if !defined(QUARANTINE_RATIO)
+#  define QUARANTINE_RATIO 4
+#endif /* !QUARANTINE_RATIO */
 
-  should_revoke = (((allocated_size + quarantine_size) >= MIN_REVOKE_HEAP_SIZE) && ((quarantine_size * QUARANTINE_RATIO) >= (allocated_size + quarantine_size)));
+  should_revoke = ((allocated_size >= MIN_REVOKE_HEAP_SIZE) && ((quarantine_size * QUARANTINE_RATIO) >= allocated_size));
 
 #endif /* !QUARANTINE_HIGHWATER */
 
@@ -607,6 +707,8 @@ void mrs_free(void *ptr) {
 
     full_quarantine = quarantine;
     quarantine = NULL;
+
+    allocated_size -= quarantine_size;
     quarantine_size = 0;
 
 #ifdef OFFLOAD_QUARANTINE
@@ -619,158 +721,4 @@ void mrs_free(void *ptr) {
     flush_full_quarantine();
 #endif /* !OFFLOAD_QUARANTINE */
   }
-}
-
-/*
- * calloc is used to bootstrap the thread library and others like libc++; it is
- * called before even the constructor function of this mrs library. before the
- * initializer is called and real_calloc is set appropriately, use this
- * bootstrap function to serve allocations. XXX these may get freed
- */
-static void *mrs_calloc_bootstrap(size_t number, size_t size) {
-#define BOOTSTRAP_CALLOC_SIZE 1024L * 1024 * 4
-  static char mem[BOOTSTRAP_CALLOC_SIZE] __attribute((aligned(16))) = {0};
-  static size_t offset = 0;
-
-  size_t old_offset = offset;
-  offset += (number * size);
-  if (offset > BOOTSTRAP_CALLOC_SIZE) {
-    mrs_printf("mrs_calloc_bootstrap: ran out of memory\n");
-    exit(7);
-  }
-  return &mem[old_offset];
-}
-
-void *mrs_calloc(size_t number, size_t size) {
-#ifdef JUST_INTERPOSE
-    return real_calloc(number, size);
-#endif /* JUST_INTERPOSE */
-
-  /*mrs_debug_printf("mrs_calloc: called\n");*/
-
-  if (number == 0 || size == 0) {
-    return NULL;
-  }
-
-  void *allocated_region;
-
-  /*
-   * ensure that all allocations less than the shadow bitmap granule size are
-   * aligned to that granule size, so that no two allocations will be governed
-   * by the same shadow bit.
-   */
-  if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
-    /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
-    if (real_posix_memalign(&allocated_region, CAPREVOKE_BITMAP_ALIGNMENT, number * size)) {
-      mrs_debug_printf("mrs_calloc: error aligning allocation of size less than the shadow bitmap granule\n");
-      return NULL;
-    }
-    memset(allocated_region, 0, cheri_getlen(allocated_region));
-  } else {
-    /*
-     * currently, sizeof(void *) == CAPREVOKE_BITMAP_ALIGNMENT == 16, which means
-     * that if size >= CAPREVOKE_BITMAP_ALIGNMENT it should be aligned to a
-     * multiple of CAPREVOKE_BITMAP_ALIGNMENT (because it is possible to store a
-     * pointer in the allocation and thus the alignment is guaranteed by calloc).
-     */
-    allocated_region = real_calloc(number, size);
-    if (allocated_region == NULL) {
-      return allocated_region;
-    }
-  }
-
-  /* allocators can implement alignment incorrectly, doesn't allow UAF but may fault */
-  /*if ((cheri_getaddress(allocated_region) & (CAPREVOKE_BITMAP_ALIGNMENT - 1)) != 0) {*/
-    /*mrs_printf("mrs_calloc: alignment failure\n");*/
-    /*exit(7);*/
-  /*}*/
-
-  allocated_size += size;
-  if (allocated_size > max_allocated_size) {
-    max_allocated_size = allocated_size;
-  }
-
-  /* XXX this causes problems if our library is initizlied before the thread library */
-  /*mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);*/
-
-  return allocated_region;
-}
-
-/*
- * replace realloc with a malloc and free to avoid dangling pointers in case of
- * in-place realloc
- */
-void *mrs_realloc(void *ptr, size_t size) {
-
-#ifdef JUST_INTERPOSE
-    return real_realloc(ptr, size);
-#endif /* JUST_INTERPOSE */
-
-  size_t old_size = cheri_getlen(ptr);
-  mrs_debug_printf("mrs_realloc: called ptr %p ptr size %zu new size %zu\n", ptr, old_size, size);
-
-  if (size == 0) {
-    mrs_free(ptr);
-    return NULL;
-  }
-
-  if (ptr == NULL) {
-    return mrs_malloc(size);
-  }
-
-  void *new_alloc = mrs_malloc(size);
-  /* old object is not deallocated according to the spec */
-  if (new_alloc == NULL) {
-    return NULL;
-  }
-  memcpy(new_alloc, ptr, size < old_size ? size : old_size);
-  mrs_free(ptr);
-  return new_alloc;
-}
-
-int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
-#ifdef JUST_INTERPOSE
-    return real_posix_memalign(ptr, alignment, size);
-#endif /* JUST_INTERPOSE */
-
-  mrs_debug_printf("mrs_posix_memalign: called ptr %p alignment %zu size %zu\n", ptr, alignment, size);
-
-  if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
-    alignment = CAPREVOKE_BITMAP_ALIGNMENT;
-  }
-
-  int ret = real_posix_memalign(ptr, alignment, size);
-  if (ret != 0) {
-    return ret;
-  }
-
-  allocated_size += size;
-  if (allocated_size > max_allocated_size) {
-    max_allocated_size = allocated_size;
-  }
-
-  return ret;
-}
-void *mrs_aligned_alloc(size_t alignment, size_t size) {
-#ifdef JUST_INTERPOSE
-    return real_aligned_alloc(alignment, size);
-#endif /* JUST_INTERPOSE */
-
-  mrs_debug_printf("mrs_aligned_alloc: called alignment %zu size %zu\n", alignment, size);
-
-  if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
-    alignment = CAPREVOKE_BITMAP_ALIGNMENT;
-  }
-
-  void *ret = real_aligned_alloc(alignment, size);
-  if (ret == NULL) {
-   return ret;
-  }
-
-  allocated_size += size;
-  if (allocated_size > max_allocated_size) {
-    max_allocated_size = allocated_size;
-  }
-
-  return real_aligned_alloc(alignment, size);
 }
