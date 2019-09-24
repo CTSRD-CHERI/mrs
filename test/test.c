@@ -30,103 +30,106 @@
 #undef NDEBUG
 #define _DEBUG
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <assert.h>
-#include <cheri/cheric.h>
+#include <sys/types.h>
 #include <sys/caprevoke.h>
 
+#include <cheri/cheric.h>
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 void assert_not_revoked(void *cap) {
-  assert(!caprevoke_is_revoked(cap));
+	assert(!caprevoke_is_revoked(cap));
 }
 
 void assert_revoked(void *cap) {
-  assert(caprevoke_is_revoked(cap));
+	assert(caprevoke_is_revoked(cap));
 }
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
 void uaf_basic_sub16() {
-  void * volatile buffer = malloc(1);
-  assert_not_revoked(buffer);
-  free(buffer);
-  assert_revoked(buffer);
+	void * volatile buffer = malloc(1);
+	assert_not_revoked(buffer);
+	free(buffer);
+	assert_revoked(buffer);
 }
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
 void uaf_basic_16() {
-  void * volatile buffer = malloc(16);
-  assert_not_revoked(buffer);
-  free(buffer);
-  assert_revoked(buffer);
+	void * volatile buffer = malloc(16);
+	assert_not_revoked(buffer);
+	free(buffer);
+	assert_revoked(buffer);
 }
 
 /* should trigger debug statements */
 void free_pages() {
-  void * volatile buffer = malloc(0x1000);
-  free(buffer);
-  buffer = malloc(0x2000);
-  free(buffer);
+	void * volatile buffer = malloc(0x1000);
+	free(buffer);
+	buffer = malloc(0x2000);
+	free(buffer);
 }
 
 /* expects revocation not to happen (doesn't fill quarantine) */
 void uaf_low_water() {
-  void * volatile buffer = malloc(1);
-  assert_not_revoked(buffer);
-  free(buffer);
-  assert_not_revoked(buffer);
+	void * volatile buffer = malloc(1);
+	assert_not_revoked(buffer);
+	free(buffer);
+	assert_not_revoked(buffer);
 }
 
 /* expects revocation to happen (fills quarantine of size 1024, no offload) */
 void uaf_high_water() {
-  void * volatile buffer1 = malloc(1);
-  assert_not_revoked(buffer1);
-  free(buffer1);
-  assert_not_revoked(buffer1);
-  void * volatile buffer2 = malloc(1024);
-  assert_not_revoked(buffer2);
-  free(buffer2);
-  assert_revoked(buffer2);
+	void * volatile buffer1 = malloc(1);
+	assert_not_revoked(buffer1);
+	free(buffer1);
+	assert_not_revoked(buffer1);
+	void * volatile buffer2 = malloc(1024);
+	assert_not_revoked(buffer2);
+	free(buffer2);
+	assert_revoked(buffer2);
 }
 
 /* expects revocation to be offloaded (fills quarantine of size 1024, waits for it to work) */
 void uaf_high_water_offload() {
-  void * volatile buffer1 = malloc(1);
-  assert_not_revoked(buffer1);
-  free(buffer1);
-  assert_not_revoked(buffer1);
-  void * volatile buffer2 = malloc(1024);
-  assert_not_revoked(buffer2);
-  free(buffer2);
-  assert_not_revoked(buffer2);
-  sleep(1);
-  assert_revoked(buffer2);
+	void * volatile buffer1 = malloc(1);
+	assert_not_revoked(buffer1);
+	free(buffer1);
+	assert_not_revoked(buffer1);
+	void * volatile buffer2 = malloc(1024);
+	assert_not_revoked(buffer2);
+	free(buffer2);
+	assert_not_revoked(buffer2);
+	sleep(1);
+	assert_revoked(buffer2);
 }
 
 /* basic stress test with many mallocs and frees */
 void basic_stress_test(int num_allocs) {
-  void * volatile * volatile allocs = malloc(sizeof(void *) * num_allocs);
-  int i = 0;
-  while (i < num_allocs) {
-    allocs[i] = malloc(1024);
-    i++;
-  }
-  while (i > 0) {
-    free(allocs[i - 1]);
-    i--;
-  }
-  free((void *)allocs);
+	void * volatile * volatile allocs = malloc(sizeof(void *) * num_allocs);
+	int i = 0;
+	while (i < num_allocs) {
+		allocs[i] = malloc(1024);
+		i++;
+	}
+	while (i > 0) {
+		free(allocs[i - 1]);
+		i--;
+	}
+	free((void *)allocs);
 }
 
 int main(int argc, char *argv[]) {
-  printf("mrs test start\n");
-  /*uaf_basic_sub16();*/
-  /*uaf_basic_16();*/
-  /*free_pages();*/
-  /*uaf_printf();*/
-  /*uaf_low_water();*/
-  /*uaf_high_water();*/
-  /*uaf_high_water_offload();*/
-  /*basic_stress_test(1024 * 16);*/
-  printf("mrs test end\n");
+	printf("mrs test start\n");
+	/*uaf_basic_sub16();*/
+	/*uaf_basic_16();*/
+	/*free_pages();*/
+	/*uaf_printf();*/
+	/*uaf_low_water();*/
+	/*uaf_high_water();*/
+	/*uaf_high_water_offload();*/
+	/*basic_stress_test(1024 * 16);*/
+	printf("mrs test end\n");
 }
