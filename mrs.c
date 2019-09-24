@@ -397,7 +397,7 @@ void *mrs_malloc(size_t size) {
   if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
     /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
     if (real_posix_memalign(&allocated_region, CAPREVOKE_BITMAP_ALIGNMENT, size)) {
-      mrs_printf("mrs_malloc: error aligning allocation of size less than the shadow bitmap granule\n");
+      mrs_debug_printf("mrs_malloc: error aligning allocation of size less than the shadow bitmap granule\n");
       return NULL;
     }
   } else {
@@ -591,7 +591,7 @@ void mrs_free(void *ptr) {
 #endif /* !QUARANTINE_HIGHWATER */
 
   if (should_revoke) {
-    mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
+    mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
 
 #ifdef OFFLOAD_QUARANTINE
     mrs_lock(&full_quarantine_lock);
@@ -662,7 +662,7 @@ void *mrs_calloc(size_t number, size_t size) {
   if (size < CAPREVOKE_BITMAP_ALIGNMENT) {
     /* use posix_memalign because unlike aligned_alloc it does not require size to be an integer multiple of alignment */
     if (real_posix_memalign(&allocated_region, CAPREVOKE_BITMAP_ALIGNMENT, number * size)) {
-      mrs_printf("mrs_calloc: error aligning allocation of size less than the shadow bitmap granule\n");
+      mrs_debug_printf("mrs_calloc: error aligning allocation of size less than the shadow bitmap granule\n");
       return NULL;
     }
     memset(allocated_region, 0, cheri_getlen(allocated_region));
@@ -690,7 +690,8 @@ void *mrs_calloc(size_t number, size_t size) {
     max_allocated_size = allocated_size;
   }
 
-  mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);
+  /* XXX this causes problems if our library is initizlied before the thread library */
+  /*mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);*/
 
   return allocated_region;
 }
