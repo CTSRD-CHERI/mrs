@@ -90,7 +90,6 @@
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
- * LOCKS: make mrs thread safe with locks
  * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
  *
  * JUST_INTERPOSE: just call the real functions
@@ -187,7 +186,11 @@ static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
 static void *entire_shadow;
 
-static struct mrs_alloc_desc *free_alloc_descs;
+#ifndef OFFLOAD_QUARANTINE
+static struct mrs_alloc_desc * free_alloc_descs;
+#else /* !OFFLOAD_QUARANTINE */
+static struct mrs_alloc_desc * _Atomic free_alloc_descs;
+#endif /* OFFLOAD_QUARANTINE */
 
 static size_t allocated_size;
 static size_t max_allocated_size;
@@ -221,8 +224,6 @@ int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size
   }
 
 create_lock(printf_lock);
-create_lock(free_alloc_descs_lock);
-create_lock(quarantine_lock);
 create_lock(full_quarantine_lock);
 
 #ifdef OFFLOAD_QUARANTINE
@@ -271,15 +272,16 @@ void _putchar(char character) {
 
 /* alloc_desc utilities */
 
-struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
+static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
+
+#ifndef OFFLOAD_QUARANTINE
   struct mrs_alloc_desc *ret;
-  mrs_lock(&free_alloc_descs_lock);
+
   if (free_alloc_descs != NULL) {
     ret = free_alloc_descs;
     free_alloc_descs = free_alloc_descs->next;
-    mrs_unlock(&free_alloc_descs_lock);
+
   } else {
-    mrs_unlock(&free_alloc_descs_lock);
 
     mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
     struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
@@ -290,14 +292,45 @@ struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
       new_descs[i].next = &new_descs[i + 1];
     }
     ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
-    mrs_lock(&free_alloc_descs_lock);
     new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = free_alloc_descs;
     free_alloc_descs = new_descs;
-    mrs_unlock(&free_alloc_descs_lock);
   }
 
   ret->allocated_region = allocated_region;
   return ret;
+
+#else /* !OFFLOAD_QUARANTINE */
+
+  struct mrs_alloc_desc *ret = free_alloc_descs;
+
+  /*
+   * XXX this shoudl work even with additional consumers, which we don't have
+   * in practice. can move the if (ret == NULL) check out of the do-while.
+   */
+  do {
+    if (ret == NULL) {
+      mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
+      struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
+      if (new_descs == MAP_FAILED) {
+        return NULL;
+      }
+      for (int i = 0; i < NEW_DESCRIPTOR_BATCH_SIZE - 2; i++) {
+        new_descs[i].next = &new_descs[i + 1];
+      }
+      ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
+
+      struct mrs_alloc_desc *ins = free_alloc_descs;
+      do {
+        new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = ins;
+      } while (!atomic_compare_exchange_weak(&free_alloc_descs, &ins, new_descs));
+      break;
+    }
+  } while (!atomic_compare_exchange_weak(&free_alloc_descs, &ret, ret->next));
+
+  ret->allocated_region = allocated_region;
+  return ret;
+
+#endif /* OFFLOAD_QUARANTINE */
 }
 
 /* initialization */
@@ -310,8 +343,6 @@ static void init(void) {
   _pthread_mutex_init_calloc_cb(&name, name ## _storage)
 
 initialize_lock(printf_lock);
-initialize_lock(free_alloc_descs_lock);
-initialize_lock(quarantine_lock);
 initialize_lock(full_quarantine_lock);
 #endif /* LOCKS */
 
@@ -481,10 +512,16 @@ static void flush_full_quarantine() {
   }
 
   /* free the quarantined descriptors */
-  mrs_lock(&free_alloc_descs_lock);
+
+#ifndef OFFLOAD_QUARANTINE
   prev->next = free_alloc_descs;
   free_alloc_descs = full_quarantine;
-  mrs_unlock(&free_alloc_descs_lock);
+#else /* !OFFLOAD_QUARANTINE */
+  struct mrs_alloc_desc *flist_head = free_alloc_descs;
+  do {
+    prev->next = flist_head;
+  } while (!atomic_compare_exchange_weak(&free_alloc_descs, &flist_head, full_quarantine));
+#endif /* OFFLOAD_QUARANTINE */
 
   full_quarantine = NULL;
 }
@@ -556,7 +593,6 @@ void mrs_free(void *ptr) {
 #endif /* BYPASS_QUARANTINE */
 
   struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr);
-  mrs_lock(&quarantine_lock);
   alloc->next = quarantine;
   quarantine = alloc;
   quarantine_size += cheri_getlen(alloc->allocated_region);
@@ -596,7 +632,6 @@ void mrs_free(void *ptr) {
     full_quarantine = quarantine;
     quarantine = NULL;
     quarantine_size = 0;
-    mrs_unlock(&quarantine_lock);
 
 #ifdef OFFLOAD_QUARANTINE
     if (pthread_cond_signal(&full_quarantine_ready)) {
@@ -607,8 +642,6 @@ void mrs_free(void *ptr) {
     flush_full_quarantine();
 #endif /* !OFFLOAD_QUARANTINE */
     mrs_unlock(&full_quarantine_lock);
-  } else {
-    mrs_unlock(&quarantine_lock);
   }
 }
 
