@@ -90,7 +90,6 @@
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
- * SANITIZE: perform sanitization on mrs function calls, TODO? exit when desired property violated
  * LOCKS: make mrs thread safe with locks
  * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
  *
@@ -477,11 +476,6 @@ static void flush_full_quarantine() {
 #endif /* !JUST_QUARANTINE */
     /* this will be a revoked capability, which the allocator must accept */
     real_free(iter->allocated_region);
-#ifdef SANITIZE
-    mrs_lock(&shadow_spaces_lock);
-    iter->shadow_desc->allocations--;
-    mrs_unlock(&shadow_spaces_lock);
-#endif /* SANITIZE */
     prev = iter;
     iter = iter->next;
   }
