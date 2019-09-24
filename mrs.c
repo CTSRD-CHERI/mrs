@@ -84,7 +84,6 @@
 /*
  * Knobs:
  *
- * STANDALONE: build mrs as a standalone shared library
  * BYPASS_QUARANTINE: MADV_FREE page-multiple allocations and never free them back to the allocator
  * OFFLOAD_QUARANTINE: process full quarantines in a separate thread
  * DEBUG: print debug statements
@@ -99,7 +98,6 @@
  *
  * Values:
  *
- * MALLOC_PREFIX: build mrs linked into an existing malloc whose functions are prefixed with MALLOC_PREFIX
  * QUARANTINE_HIGHWATER: limit the quarantine size to QUARANTINE_HIGHWATER number of bytes
  * QUARANTINE_RATIO: limit the quarantine size to 1 / QUARANTINE_RATIO times the size of the heap (default 4)
  *
@@ -123,11 +121,7 @@
  * malloc to temporally safe malloc easy.
  */
 
-#define concat_resolved(a, b) a ## b
-/* need a function without ## so args will be resolved */
-#define concat(a, b) concat_resolved(a,b)
-
-#define cheri_testsubset(x, y) __builtin_cheri_subset_test((x), (y))
+#define cheri_testsubset(x, y) __builtin_cheri_subset_test((x), (y)) // TODO add to cheric.h
 
 /* function declarations and definitions */
 
@@ -158,15 +152,6 @@ int posix_memalign(void **ptr, size_t alignment, size_t size) {
 void *aligned_alloc(size_t alignment, size_t size) {
   return mrs_aligned_alloc(alignment, size);
 }
-
-#ifdef MALLOC_PREFIX
-void *concat(MALLOC_PREFIX,_malloc)(size_t size);
-void concat(MALLOC_PREFIX,_free)(void *ptr);
-void *concat(MALLOC_PREFIX,_calloc)(size_t, size_t);
-void *concat(MALLOC_PREFIX,_realloc)(void *, size_t);
-int concat(MALLOC_PREFIX,_posix_memalign)(void **, size_t, size_t);
-void *concat(MALLOC_PREFIX,_aligned_alloc)(size_t, size_t);
-#endif /* MALLOC_PREFIX */
 
 /* globals */
 
@@ -348,23 +333,12 @@ initialize_lock(printf_lock);
 initialize_lock(full_quarantine_lock);
 #endif /* OFFLOAD_QUARANTINE */
 
-#if defined(STANDALONE)
   real_malloc = dlsym(RTLD_NEXT, "malloc");
   real_free = dlsym(RTLD_NEXT, "free");
   real_calloc = dlsym(RTLD_NEXT, "calloc");
   real_realloc = dlsym(RTLD_NEXT, "realloc");
   real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
   real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
-#elif /* STANDALONE */ defined(MALLOC_PREFIX)
-  real_malloc = concat(MALLOC_PREFIX, _malloc);
-  real_free = concat(MALLOC_PREFIX, _free);
-  real_calloc = concat(MALLOC_PREFIX, _calloc);
-  real_realloc = concat(MALLOC_PREFIX, _realloc);
-  real_posix_memalign = concat(MALLOC_PREFIX, _posix_memalign);
-  real_aligned_alloc = concat(MALLOC_PREFIX, _aligned_alloc);
-#else /* !STANDALONE && MALLOC_PREFIX */
-#error must build mrs with either STANDALONE or MALLOC_PREFIX defined
-#endif /* !(STANDALONE || MALLOC_PREFIX) */
 
 #ifdef OFFLOAD_QUARANTINE
   /* spawn offload thread XXX in purecap spwaning this thread in init() causes main() not to be called */
