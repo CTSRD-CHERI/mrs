@@ -144,8 +144,6 @@ static void *(*real_aligned_alloc) (size_t, size_t);
 
 /* locks */
 
-#if defined(DEBUG) || defined(OFFLOAD_QUARANTINE)
-
 #define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
 #define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
 
@@ -164,13 +162,7 @@ int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size
 #define initialize_lock(name) \
 	_pthread_mutex_init_calloc_cb(&name, name ## _storage)
 
-#else /* DEBUG || OFFLOAD_QUARANTINE */
-
-#define mrs_lock(mtx)
-#define mrs_unlock(mtx)
-
-#endif /* !DEBUG && !OFFLOAD_QUARANTINE */
-
+/* quarantine offload support */
 #ifdef OFFLOAD_QUARANTINE
 static void *full_quarantine_offload(void *);
 create_lock(full_quarantine_lock);
@@ -179,14 +171,15 @@ pthread_cond_t full_quarantine_empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t full_quarantine_ready = PTHREAD_COND_INITIALIZER;
 #endif /* OFFLOAD_QUARANTINE */
 
-/* printf support: not thread safe */
+/* printf support */
 
+create_lock(printf_lock);
 void _putchar(char character) {
 	write(2, &character, sizeof(char));
 }
 
 #define mrs_printf(fmt, ...) \
-	do {printf(("mrs: " fmt), ##__VA_ARGS__);} while (0)
+	do {mrs_lock(&printf_lock);printf(("mrs: " fmt), ##__VA_ARGS__);mrs_unlock(&printf_lock);} while (0)
 
 #define mrs_printcap(name, cap) \
 	mrs_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
@@ -194,20 +187,11 @@ void _putchar(char character) {
 /* debugging */
 
 #ifdef DEBUG
-
-create_lock(printf_lock);
-
-#define mrs_debug_printf(fmt, ...) \
-	mrs_printf(fmt, ##__VA_ARGS__)
-
-#define mrs_debug_printcap(name, cap) \
-	mrs_printcap(name,cap)
-
+#define mrs_debug_printf(fmt, ...) mrs_printf(fmt, ##__VA_ARGS__)
+#define mrs_debug_printcap(name, cap) mrs_printcap(name, cap)
 #else /* DEBUG */
-
 #define mrs_debug_printf(fmt, ...)
 #define mrs_debug_printcap(name, cap)
-
 #endif /* !DEBUG */
 
 /* utilities */
@@ -283,9 +267,7 @@ static void init(void) {
 	real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
 	real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
 
-#ifdef DEBUG
 	initialize_lock(printf_lock);
-#endif /* DEBUG */
 
 #ifdef OFFLOAD_QUARANTINE
 	initialize_lock(full_quarantine_lock);
@@ -611,11 +593,11 @@ static void *full_quarantine_offload(void *arg) {
 		}
 		mrs_debug_printf("full_quarantine_offload: full_quarantine ready\n");
 		flush_full_quarantine();
+		mrs_unlock(&full_quarantine_lock);
 		if (pthread_cond_signal(&full_quarantine_empty)) {
 				mrs_printf("pthread error\n");
 				exit(7);
 		}
-		mrs_unlock(&full_quarantine_lock);
 	}
 	return NULL;
 }
@@ -691,7 +673,7 @@ void mrs_free(void *ptr) {
 #endif /* !QUARANTINE_HIGHWATER */
 
 	if (should_revoke) {
-		mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
+		mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
 
 #ifdef OFFLOAD_QUARANTINE
 		mrs_lock(&full_quarantine_lock);
@@ -712,11 +694,11 @@ void mrs_free(void *ptr) {
 		quarantine_size = 0;
 
 #ifdef OFFLOAD_QUARANTINE
+		mrs_unlock(&full_quarantine_lock);
 		if (pthread_cond_signal(&full_quarantine_ready)) {
 			mrs_printf("pthread error\n");
 			exit(7);
 		}
-		mrs_unlock(&full_quarantine_lock);
 #else /* OFFLOAD_QUARANTINE */
 		flush_full_quarantine();
 #endif /* !OFFLOAD_QUARANTINE */
