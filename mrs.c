@@ -696,7 +696,7 @@ void mrs_free(void *ptr) {
 	alloc->next = quarantine;
 	quarantine = alloc;
 
-	increment_quarantine_size(cheri_getlen(alloc->allocated_region));
+	increment_quarantine_size(alloc->allocated_region);
 
 	bool should_revoke;
 

@@ -13,6 +13,10 @@ extern "C" {
 
 /* version (1) */
 void * operator new(size_t size) {
+	/* don't throw for size 0 allocations - technically this returned pointer should be non-null */
+	if (size == 0) {
+		return NULL;
+	}
 	void *ret = mrs_malloc(size);
 	if (ret == NULL) {
 		throw std::bad_alloc();
@@ -22,6 +26,10 @@ void * operator new(size_t size) {
 
 /* version (2) */
 void * operator new[](size_t size) {
+	/* don't throw for size 0 allocations - technically this returned pointer should be non-null */
+	if (size == 0) {
+		return NULL;
+	}
 	void *ret = mrs_malloc(size);
 	if (ret == NULL) {
 		throw std::bad_alloc();
