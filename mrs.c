@@ -196,15 +196,42 @@ void _putchar(char character) {
 
 /* utilities */
 
-static inline void increment_allocated_size(size_t size) {
-	allocated_size += size;
+/*
+ * TODO:
+ * we assume that the consumer of this shim can issue arbitrary malicious
+ * malloc/free calls. by using the length of the capability returned from
+ * malloc to increment allocated size and the capability given back by the user
+ * to increment the quarantine size (only if that capability's base is actually
+ * the base of an allocation, as confirmed by usable_malloc_size), we guarantee
+ * that for each freed allocation, allocated_size will have beenincremented by
+ * at least as much as quarantine_size gets incremented. this is important
+ * because quarantine_size gets subtracted from allocated_size. if the above
+ * guarantee did not hold, an attacker could make allocated_size go negative
+ * and prevent sweeps from taking place (this still does not allow heap aliasing).
+ *
+ * we could alternatively call malloc_usable_size during allocation and free to
+ * make sure the same number is being added to allocated_size and
+ * quarantine_size, but this adds a slight additional cost to allocation.
+ * perhaps worth it.
+ *
+ * in the current code it is still possible for an attacker to inflate
+ * quarantine_size by repeatedly freeing the same legitimately allocated
+ * pointer. one solution to this is to paint the bitmap as each allocation is
+ * freed, and only report the painting as a success if the region of the bitmap
+ * is not already painted. this might slightly increase the cost of painting
+ * and lessen the benefit of the offload thread. another possible solution is
+ * to detect when allocated_size goes negative and take some appropriate
+ * action, but more thought is needed there.
+ */
+static inline void increment_allocated_size(void *allocated) {
+	allocated_size += cheri_getlen(allocated);
 	if (allocated_size > max_allocated_size) {
 		max_allocated_size = allocated_size;
 	}
 }
 
-static inline void increment_quarantine_size(size_t size) {
-	quarantine_size += size;
+static inline void increment_quarantine_size(void *freed) {
+	quarantine_size += cheri_getlen(freed);
 	if (quarantine_size > max_quarantine_size) {
 		max_quarantine_size = quarantine_size;
 	}
@@ -362,7 +389,7 @@ void *mrs_malloc(size_t size) {
 	memset(allocated_region, 0, cheri_getlen(allocated_region));
 #endif /* CLEAR_ALLOCATIONS */
 
-	increment_allocated_size(size);
+	increment_allocated_size(allocated_region);
 
 	mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, allocated_region);
 
@@ -428,7 +455,7 @@ void *mrs_calloc(size_t number, size_t size) {
 		}
 	}
 
-	/*increment_allocated_size(size);*/
+	increment_allocated_size(allocated_region);
 
 	/* this causes problems if our library is initizlied before the thread library */
 	/*mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);*/
@@ -452,7 +479,7 @@ int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
 		return ret;
 	}
 
-	increment_allocated_size(size);
+	increment_allocated_size(*ptr);
 
 	return ret;
 }
@@ -468,14 +495,14 @@ void *mrs_aligned_alloc(size_t alignment, size_t size) {
 		alignment = CAPREVOKE_BITMAP_ALIGNMENT;
 	}
 
-	void *ret = real_aligned_alloc(alignment, size);
-	if (ret == NULL) {
-	 return ret;
+	void *allocated_region = real_aligned_alloc(alignment, size);
+	if (allocated_region == NULL) {
+	 return allocated_region;
 	}
 
-	increment_allocated_size(size);
+	increment_allocated_size(allocated_region);
 
-	return ret;
+	return allocated_region;
 }
 
 /*
@@ -625,10 +652,24 @@ void mrs_free(void *ptr) {
 	return;
 #endif /* JUST_BOOKKEEPING */
 
-	/* TODO XXX
-	 * we can't trust the base and len that are provided by the caller here, we need to get the original allocation's
-	 * capability from the allocator (or know if there isn't one)
+	/* TODO:
+	 * we can't trust the base and len that are provided by the caller here, we
+	 * need to know the full usable size of the initial allocation and whether
+	 * the pointer provided by the caller is valid. this is the exact behavior of
+	 * the semi-standard malloc_usable_size (return the usable size of the
+	 * allocation pointed to by ptr, which may be greater than the original size
+	 * returned, or 0 if ptr does not point to an allocation) in allocators that
+	 * have not been modified for purecap CHERI. we suggest that when porting an
+	 * allocator to purecap CHERI, the existing malloc_usable_size function is
+	 * renamed to malloc_allocated_size, and the implementation of
+	 * malloc_usable_size(ptr) simply returns the minimum of
+	 * malloc_usable_size(ptr) and cheri_getlen(ptr).
 	 */
+
+	/*if (malloc_allocated_size(ptr) == 0) {*/
+		/*return;*/
+	/*}*/
+	/* otherwise use this size to paint the bitmap */
 
 #ifdef BYPASS_QUARANTINE
 	/*
