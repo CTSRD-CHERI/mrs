@@ -83,8 +83,6 @@ void *mrs_realloc(void *, size_t);
 int mrs_posix_memalign(void **, size_t, size_t);
 void *mrs_aligned_alloc(size_t, size_t);
 
-static void *mrs_calloc_bootstrap(size_t number, size_t size);
-
 void *malloc(size_t size) {
 	return mrs_malloc(size);
 }
@@ -134,6 +132,8 @@ static size_t max_quarantine_size;
 
 static struct mrs_alloc_desc *quarantine;
 static struct mrs_alloc_desc *full_quarantine;
+
+static void *mrs_calloc_bootstrap(size_t number, size_t size);
 
 static void *(*real_malloc) (size_t);
 static void (*real_free) (void *);
@@ -195,6 +195,20 @@ void _putchar(char character) {
 #endif /* !DEBUG */
 
 /* utilities */
+
+static inline void increment_allocated_size(size_t size) {
+	allocated_size += size;
+	if (allocated_size > max_allocated_size) {
+		max_allocated_size = allocated_size;
+	}
+}
+
+static inline void increment_quarantine_size(size_t size) {
+	quarantine_size += size;
+	if (quarantine_size > max_quarantine_size) {
+		max_quarantine_size = quarantine_size;
+	}
+}
 
 static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
 
@@ -348,10 +362,7 @@ void *mrs_malloc(size_t size) {
 	memset(allocated_region, 0, cheri_getlen(allocated_region));
 #endif /* CLEAR_ALLOCATIONS */
 
-	allocated_size += size;
-	if (allocated_size > max_allocated_size) {
-		max_allocated_size = allocated_size;
-	}
+	increment_allocated_size(size);
 
 	mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, allocated_region);
 
@@ -417,10 +428,7 @@ void *mrs_calloc(size_t number, size_t size) {
 		}
 	}
 
-	allocated_size += size;
-	if (allocated_size > max_allocated_size) {
-		max_allocated_size = allocated_size;
-	}
+	/*increment_allocated_size(size);*/
 
 	/* this causes problems if our library is initizlied before the thread library */
 	/*mrs_debug_printf("mrs_calloc: exit called %d size 0x%zx address %p\n", number, size, allocated_region);*/
@@ -444,10 +452,7 @@ int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
 		return ret;
 	}
 
-	allocated_size += size;
-	if (allocated_size > max_allocated_size) {
-		max_allocated_size = allocated_size;
-	}
+	increment_allocated_size(size);
 
 	return ret;
 }
@@ -468,10 +473,7 @@ void *mrs_aligned_alloc(size_t alignment, size_t size) {
 	 return ret;
 	}
 
-	allocated_size += size;
-	if (allocated_size > max_allocated_size) {
-		max_allocated_size = allocated_size;
-	}
+	increment_allocated_size(size);
 
 	return ret;
 }
@@ -653,10 +655,7 @@ void mrs_free(void *ptr) {
 	alloc->next = quarantine;
 	quarantine = alloc;
 
-	quarantine_size += cheri_getlen(alloc->allocated_region);
-	if (quarantine_size > max_quarantine_size) {
-		max_quarantine_size = quarantine_size;
-	}
+	increment_quarantine_size(cheri_getlen(alloc->allocated_region));
 
 	bool should_revoke;
 
@@ -673,7 +672,7 @@ void mrs_free(void *ptr) {
 #endif /* !QUARANTINE_HIGHWATER */
 
 	if (should_revoke) {
-		mrs_debug_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
+		mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
 
 #ifdef OFFLOAD_QUARANTINE
 		mrs_lock(&full_quarantine_lock);
@@ -704,3 +703,22 @@ void mrs_free(void *ptr) {
 #endif /* !OFFLOAD_QUARANTINE */
 	}
 }
+
+/* TODO:
+ * malloc_usable_size
+ *
+ * #if !defined(__FreeBSD__) && !defined(__OpenBSD__) reallocarray #endif
+ *
+ * memalign
+ *
+ * #if !defined(__FreeBSD__) && !defined(__OpenBSD__) valloc #endif
+ *
+ * mallctl
+ *
+ *   required to work before TLS is set up in statically linked programs
+ * #if !defined(__PIC__) && !defined(NO_BOOTSTRAP_ALLOCATOR)
+ *   __je_bootstrap_malloc
+ *   __je_bootstrap_calloc
+ *   __je_bootstrap_free
+ * #endif
+ */

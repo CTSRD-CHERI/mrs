@@ -6,7 +6,7 @@ project(mrs C CXX)
 #################
 
 # build mrs
-add_library(mrs SHARED mrs.c printf.c)
+add_library(mrs SHARED mrs.c mrs-new.cc printf.c)
 target_link_libraries(mrs pthread cheri_caprevoke)
 
 # build jemalloc
