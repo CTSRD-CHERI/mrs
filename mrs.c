@@ -571,7 +571,7 @@ static void flush_full_quarantine() {
 	caprevoke_epoch start_epoch = cri->epoch_enqueue;
 	struct caprevoke_stats crst;
 #ifdef CONCURRENT_REVOCATION_PASS
-	const int MRS_CAPREVOKE_FLAGS = CAPREVOKE_LAST_PASS;
+	const int MRS_CAPREVOKE_FLAGS = CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC;
 #else /* CONCURRENT_REVOCATION_PASS */
 	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
 #endif
