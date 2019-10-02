@@ -3177,12 +3177,11 @@ je_malloc_stats_print(void (*write_cb)(void *, const char *), void *cbopaque,
 	LOG("core.malloc_stats_print.exit", "");
 }
 
+__attribute__((always_inline))
 JEMALLOC_EXPORT size_t JEMALLOC_NOTHROW
-je_malloc_usable_size(JEMALLOC_USABLE_SIZE_CONST void *ptr) {
+je_malloc_allocation_size(JEMALLOC_USABLE_SIZE_CONST void *ptr) {
 	size_t ret;
 	tsdn_t *tsdn;
-
-	LOG("core.malloc_usable_size.entry", "ptr: %p", ptr);
 
 	assert(malloc_initialized() || IS_INITIALIZER);
 
@@ -3198,14 +3197,25 @@ je_malloc_usable_size(JEMALLOC_USABLE_SIZE_CONST void *ptr) {
 		} else {
 			ret = isalloc(tsdn, ptr);
 		}
+	}
+
+	check_entry_exit_locking(tsdn);
+	return ret;
+}
+
+JEMALLOC_EXPORT size_t JEMALLOC_NOTHROW
+je_malloc_usable_size(JEMALLOC_USABLE_SIZE_CONST void *ptr) {
+	size_t ret;
+
+	LOG("core.malloc_usable_size.entry", "ptr: %p", ptr);
+
+	ret = je_malloc_allocation_size(ptr);
 #ifdef __CHERI_PURE_CAPABILITY__
 		if (config_cheri_setbounds && ret != 0) {
 			ret = MIN(ret, cheri_getlen(ptr));
 		}
 #endif
-	}
 
-	check_entry_exit_locking(tsdn);
 	LOG("core.malloc_usable_size.exit", "result: %zu", ret);
 	return ret;
 }
