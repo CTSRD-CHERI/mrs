@@ -121,6 +121,15 @@ void basic_stress_test(int num_allocs) {
 	free((void *)allocs);
 }
 
+size_t __attribute__((weak)) malloc_allocation_size(void *);
+
+void malloc_allocation_size_test() {
+	int x = 0;
+	void *ptr = malloc(7);
+	assert(malloc_allocation_size(ptr) != 0);
+	assert(malloc_allocation_size((void *)&x) == 0); /* or crash, but that is rude */
+}
+
 int main(int argc, char *argv[]) {
 	printf("mrs test start\n");
 	/*uaf_basic_sub16();*/
@@ -131,5 +140,6 @@ int main(int argc, char *argv[]) {
 	/*uaf_high_water();*/
 	/*uaf_high_water_offload();*/
 	/*basic_stress_test(1024 * 16);*/
+	malloc_allocation_size_test();
 	printf("mrs test end\n");
 }

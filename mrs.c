@@ -102,6 +102,8 @@ void *aligned_alloc(size_t alignment, size_t size) {
 	return mrs_aligned_alloc(alignment, size);
 }
 
+size_t malloc_allocation_size(void *);
+
 /* globals */
 
 // TODO investigate replacing with linked list of arrays
@@ -571,7 +573,7 @@ static void flush_full_quarantine() {
 	caprevoke_epoch start_epoch = cri->epoch_enqueue;
 	struct caprevoke_stats crst;
 #ifdef CONCURRENT_REVOCATION_PASS
-	const int MRS_CAPREVOKE_FLAGS = CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC;
+	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC);
 #else /* CONCURRENT_REVOCATION_PASS */
 	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
 #endif
@@ -647,11 +649,6 @@ void mrs_free(void *ptr) {
 		return;
 	}
 
-#ifdef JUST_BOOKKEEPING
-	real_free(ptr);
-	return;
-#endif /* JUST_BOOKKEEPING */
-
 	/* TODO:
 	 * we can't trust the base and len that are provided by the caller here, we
 	 * need to know the full usable size of the initial allocation and whether
@@ -661,15 +658,20 @@ void mrs_free(void *ptr) {
 	 * returned, or 0 if ptr does not point to an allocation) in allocators that
 	 * have not been modified for purecap CHERI. we suggest that when porting an
 	 * allocator to purecap CHERI, the existing malloc_usable_size function is
-	 * renamed to malloc_allocated_size, and the implementation of
+	 * renamed to malloc_allocation_size, and the implementation of
 	 * malloc_usable_size(ptr) simply returns the minimum of
 	 * malloc_usable_size(ptr) and cheri_getlen(ptr).
 	 */
 
-	/*if (malloc_allocated_size(ptr) == 0) {*/
-		/*return;*/
-	/*}*/
+	if (malloc_allocation_size(ptr) == 0) {
+		return;
+	}
 	/* otherwise use this size to paint the bitmap */
+
+#ifdef JUST_BOOKKEEPING
+	real_free(ptr);
+	return;
+#endif /* JUST_BOOKKEEPING */
 
 #ifdef BYPASS_QUARANTINE
 	/*
