@@ -102,13 +102,14 @@ void *aligned_alloc(size_t alignment, size_t size) {
 	return mrs_aligned_alloc(alignment, size);
 }
 
-size_t malloc_allocation_size(void *);
+size_t malloc_allocation_size(void *) __attribute__((weak));
 
 /* globals */
 
 // TODO investigate replacing with linked list of arrays
 struct mrs_alloc_desc {
 	void *allocated_region;
+	size_t alloc_size;
 	struct mrs_alloc_desc *next;
 };
 
@@ -239,7 +240,7 @@ static inline void increment_quarantine_size(void *freed) {
 	}
 }
 
-static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
+static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, size_t alloc_size) {
 
 #ifndef OFFLOAD_QUARANTINE
 	struct mrs_alloc_desc *ret;
@@ -262,6 +263,7 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
 		free_alloc_descs = new_descs;
 	}
 
+	ret->alloc_size = alloc_size;
 	ret->allocated_region = allocated_region;
 	return ret;
 
@@ -293,6 +295,7 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region) {
 		}
 	} while (!atomic_compare_exchange_weak(&free_alloc_descs, &ret, ret->next));
 
+	ret->alloc_size = alloc_size;
 	ret->allocated_region = allocated_region;
 	return ret;
 
@@ -561,11 +564,11 @@ void *mrs_realloc(void *ptr, size_t size) {
 static void flush_full_quarantine() {
 	struct mrs_alloc_desc *iter = full_quarantine;
 #if !defined(JUST_QUARANTINE)
-	while (iter != NULL) {
+	/*while (iter != NULL) {*/
 		/*caprev_shadow_nomap_set(iter->shadow, iter->vmmap_cap, iter->allocated_region);*/
-		caprev_shadow_nomap_set_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
-		iter = iter->next;
-	}
+		/*caprev_shadow_nomap_set_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));*/
+		/*iter = iter->next;*/
+	/*}*/
 #endif /* !JUST_QUARANTINE */
 
 #if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
@@ -587,7 +590,9 @@ static void flush_full_quarantine() {
 	while (iter != NULL) {
 #if !defined(JUST_QUARANTINE)
 		/*caprev_shadow_nomap_clear(iter->shadow, iter->allocated_region);*/
-		caprev_shadow_nomap_clear_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));
+		/*caprev_shadow_nomap_clear_raw(entire_shadow, cheri_getbase(iter->allocated_region), cheri_getbase(iter->allocated_region) + __builtin_align_up(cheri_getlen(iter->allocated_region), CAPREVOKE_BITMAP_ALIGNMENT));*/
+		/* doesn't matter if alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
+		caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->allocated_region), __builtin_align_up(iter->alloc_size, CAPREVOKE_BITMAP_ALIGNMENT));
 		atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
 		/* this will be a revoked capability, which the allocator must accept */
@@ -642,31 +647,73 @@ void mrs_free(void *ptr) {
 	mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
 	/*
-	 * short-circuit if ptr has been revoked. if multiple threads, this should be
-	 * checked atomically as the bitmap is painted.
+	 * short circuit if the passed-in pointer is untagged or if its base does not
+	 * correspond to an allocation. otherwise, get the size of the full
+	 * underlying allocation for bitmap painting (as opposed to the length of the
+	 * passed-in pointer, which is user-controlled and may not overlap with all
+	 * possible pointers derived from the initial allocation). use an untagged
+	 * check rather than == NULL because it catches the NULL capability as well
+	 * as others that might cause rude malloc_allocation_size implementations
+	 * to crash.
 	 */
-	if (ptr == NULL || caprevoke_is_revoked(ptr)) {
+	if (!cheri_gettag(ptr)) {
+		return;
+	}
+	size_t alloc_size = malloc_allocation_size(ptr);
+	if (alloc_size == 0) {
 		return;
 	}
 
-	/* TODO:
-	 * we can't trust the base and len that are provided by the caller here, we
-	 * need to know the full usable size of the initial allocation and whether
-	 * the pointer provided by the caller is valid. this is the exact behavior of
-	 * the semi-standard malloc_usable_size (return the usable size of the
-	 * allocation pointed to by ptr, which may be greater than the original size
-	 * returned, or 0 if ptr does not point to an allocation) in allocators that
-	 * have not been modified for purecap CHERI. we suggest that when porting an
-	 * allocator to purecap CHERI, the existing malloc_usable_size function is
-	 * renamed to malloc_allocation_size, and the implementation of
-	 * malloc_usable_size(ptr) simply returns the minimum of
-	 * malloc_usable_size(ptr) and cheri_getlen(ptr).
+	/*
+	 * here we use the bitmap to synchronize and make sure that our guarantee is
+	 * upheld in multithreaded environments. we paint the bitmap to signal to the
+	 * kernel what needs to be revoked, but we also gate the operation of bitmap
+	 * painting, so that we can only successfully paint the bitmap for some freed
+	 * allocation (and let that allocation pass onto the quarantine list) if it
+	 * is legitimately allocated on the heap, not revoked, and not previously
+	 * queued for revocation, at the time of painting.
+	 *
+	 * essentially at this point we don't want something to end up on the
+	 * quarantine list twice. if that were to happen, we wouldn't be upholding
+	 * the principle that prevents heap aliasing.
+	 *
+	 * we can't allow a capability to pass painting and end up on the quarantine
+	 * list if its region of the bitmap is already painted. if that were to
+	 * happen, the two quarantine list entries corresponding to that region would
+	 * be freed non-atomically, such that we could observe one being freed, the allocator reallocating the region,
+	 * then the other being freed <! ERROR !>
+	 *
+	 * we also can't allow a previously revoked capability to pass painting and
+	 * end up on the quarantine list. if that were to happen, we could observe:
+	 *
+	 * ptr mrs_freed -> painted in bitmap -> added to quarantine -> revoked ->
+	 * cleared in bitmap -> /THREAD SWITCH/ revoked ptr mrs_freed -> painted in
+	 * bitmap -> revoked again -> cleared in bitmap -> freed back to allocator ->
+	 * reused /THREAD SWITCH BACK/ -> freed back to allocator <! ERROR !>
+	 *
+	 * similarly for untagged capabilities, because then a malicious user could
+	 * just construct a capability that takes the place of revoked ptr (i.e. same
+	 * address) above.
+	 *
+	 * we block these behaviors with a bitmap painting function that takes in a
+	 * user pointer and the full length of the allocation. it will only succeed
+	 * if, atomically at the time of painting, (1) the bitmap region is not
+	 * painted (2) the user pointer is tagged (3) the user pointer is not
+	 * revoked. if the painting function fails, we short-circuit and do not add
+	 * allocation to quarantine.
+	 *
+	 * we can clear the bitmap after revocation and before freeing back to the
+	 * allocator, which "opens" the gate for revocation of that region to occur
+	 * again. it's fine for clearing not to be atomic with freeing back to the
+	 * allocator, though, because between revocation and the allocator
+	 * reallocating the region, the user does not have any valid capabilities to
+	 * the region by definition.
 	 */
-
-	if (malloc_allocation_size(ptr) == 0) {
+		/* doesn't matter if alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
+	if (caprev_shadow_nomap_set_len(entire_shadow, cheri_getbase(ptr), __builtin_align_up(alloc_size, CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
+		mrs_debug_printf("mrs_free: setting bitmap failed\n");
 		return;
 	}
-	/* otherwise use this size to paint the bitmap */
 
 #ifdef JUST_BOOKKEEPING
 	real_free(ptr);
@@ -694,7 +741,7 @@ void mrs_free(void *ptr) {
 	}
 #endif /* BYPASS_QUARANTINE */
 
-	struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr);
+	struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr, alloc_size);
 	alloc->next = quarantine;
 	quarantine = alloc;
 
@@ -748,7 +795,6 @@ void mrs_free(void *ptr) {
 }
 
 /* TODO:
- * malloc_usable_size
  *
  * #if !defined(__FreeBSD__) && !defined(__OpenBSD__) reallocarray #endif
  *

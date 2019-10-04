@@ -121,13 +121,29 @@ void basic_stress_test(int num_allocs) {
 	free((void *)allocs);
 }
 
+void reuse_test() {
+	for (int i = 0; i < 1024; i++) {
+		void * volatile ptr = malloc(16);
+		free(ptr);
+	}
+}
+
 size_t __attribute__((weak)) malloc_allocation_size(void *);
 
 void malloc_allocation_size_test() {
 	int x = 0;
-	void *ptr = malloc(7);
+	void * volatile ptr = malloc(7);
 	assert(malloc_allocation_size(ptr) != 0);
 	assert(malloc_allocation_size((void *)&x) == 0); /* or crash, but that is rude */
+}
+
+/* with quarantine highwater 1 tests revoked free, with >16 tests double free. both test untagged free. */
+void invalid_free_test() {
+	void * volatile ptr = malloc(16);
+	free(ptr);
+	free(ptr);
+	ptr = (void *)0x7;
+	free(ptr);
 }
 
 int main(int argc, char *argv[]) {
@@ -140,6 +156,8 @@ int main(int argc, char *argv[]) {
 	/*uaf_high_water();*/
 	/*uaf_high_water_offload();*/
 	/*basic_stress_test(1024 * 16);*/
-	malloc_allocation_size_test();
+	/*reuse_test();*/
+	invalid_free_test();
+	/*malloc_allocation_size_test();*/
 	printf("mrs test end\n");
 }
