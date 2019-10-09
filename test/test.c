@@ -157,7 +157,7 @@ int main(int argc, char *argv[]) {
 	/*uaf_high_water_offload();*/
 	/*basic_stress_test(1024 * 16);*/
 	/*reuse_test();*/
-	invalid_free_test();
+	/*invalid_free_test();*/
 	/*malloc_allocation_size_test();*/
 	printf("mrs test end\n");
 }
