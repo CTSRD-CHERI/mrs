@@ -101,7 +101,6 @@ void uaf_high_water_offload() {
 	void * volatile buffer2 = malloc(1024);
 	assert_not_revoked(buffer2);
 	free(buffer2);
-	assert_not_revoked(buffer2);
 	sleep(1);
 	assert_revoked(buffer2);
 }

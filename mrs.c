@@ -114,10 +114,16 @@ size_t malloc_allocation_size(void *) __attribute__((weak));
 
 /* globals */
 
+struct mrs_quarantine {
+	size_t size;
+	size_t max_size;
+	struct mrs_alloc_desc *list;
+};
+
 // TODO investigate replacing with linked list of arrays, remove internal calls to mrs functions
 struct mrs_alloc_desc {
 	void *allocated_region;
-	size_t alloc_size;
+	size_t alloc_size; /* this is the actual size of the container underlying the allocation, may be different than cheri_getlen() of the region */
 	struct mrs_alloc_desc *next;
 };
 
@@ -135,15 +141,15 @@ static struct mrs_alloc_desc * free_alloc_descs;
 #else /* !OFFLOAD_QUARANTINE */
 // XXX false sharing, ABA, etc... switch to library
 static struct mrs_alloc_desc * _Atomic free_alloc_descs;
-static struct mrs_alloc_desc * _Atomic offloaded_descs;
 #endif /* OFFLOAD_QUARANTINE */
 
 static size_t allocated_size; /* amount of memory that the allocator views as allocated (includes quarantine) */
-static size_t max_allocated_size; // XXX
-static size_t quarantine_size; /* amount of memory in quarantine */
-static size_t max_quarantine_size; // XXX
+static size_t max_allocated_size;
 
-static struct mrs_alloc_desc *quarantine;
+static struct mrs_quarantine quarantine;
+#ifdef OFFLOAD_QUARANTINE
+static struct mrs_quarantine offload_quarantine;
+#endif /* OFFLOAD_QUARANTINE */
 
 static void *mrs_calloc_bootstrap(size_t number, size_t size);
 
@@ -177,6 +183,10 @@ int _pthread_mutex_init_calloc_cb(pthread_mutex_t *mutex, void *(calloc_cb)(size
 /* quarantine offload support */
 #ifdef OFFLOAD_QUARANTINE
 static void *mrs_offload_thread(void *);
+create_lock(offload_quarantine_lock);
+/* no hack for these because condition variables are not used in allocation routines */
+pthread_cond_t offload_quarantine_empty = PTHREAD_COND_INITIALIZER;
+pthread_cond_t offload_quarantine_ready = PTHREAD_COND_INITIALIZER;
 #endif /* OFFLOAD_QUARANTINE */
 
 /* printf support */
@@ -203,47 +213,6 @@ void _putchar(char character) {
 #endif /* !DEBUG */
 
 /* utilities */
-
-/*
- * TODO:
- * we assume that the consumer of this shim can issue arbitrary malicious
- * malloc/free calls. by using the length of the capability returned from
- * malloc to increment allocated size and the capability given back by the user
- * to increment the quarantine size (only if that capability's base is actually
- * the base of an allocation, as confirmed by usable_malloc_size), we guarantee
- * that for each freed allocation, allocated_size will have beenincremented by
- * at least as much as quarantine_size gets incremented. this is important
- * because quarantine_size gets subtracted from allocated_size. if the above
- * guarantee did not hold, an attacker could make allocated_size go negative
- * and prevent sweeps from taking place (this still does not allow heap aliasing).
- *
- * we could alternatively call malloc_usable_size during allocation and free to
- * make sure the same number is being added to allocated_size and
- * quarantine_size, but this adds a slight additional cost to allocation.
- * perhaps worth it.
- *
- * in the current code it is still possible for an attacker to inflate
- * quarantine_size by repeatedly freeing the same legitimately allocated
- * pointer. one solution to this is to paint the bitmap as each allocation is
- * freed, and only report the painting as a success if the region of the bitmap
- * is not already painted. this might slightly increase the cost of painting
- * and lessen the benefit of the offload thread. another possible solution is
- * to detect when allocated_size goes negative and take some appropriate
- * action, but more thought is needed there.
- */
-static inline void increment_allocated_size(void *allocated) {
-	allocated_size += cheri_getlen(allocated);
-	if (allocated_size > max_allocated_size) {
-		max_allocated_size = allocated_size;
-	}
-}
-
-static inline void increment_quarantine_size(void *freed) {
-	quarantine_size += cheri_getlen(freed);
-	if (quarantine_size > max_quarantine_size) {
-		max_quarantine_size = quarantine_size;
-	}
-}
 
 static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, size_t alloc_size) {
 
@@ -308,6 +277,212 @@ static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, size_t al
 #endif /* OFFLOAD_QUARANTINE */
 }
 
+/*
+ * TODO:
+ * we assume that the consumer of this shim can issue arbitrary malicious
+ * malloc/free calls. by using the length of the capability returned from
+ * malloc to increment allocated size and the capability given back by the user
+ * to increment the quarantine size (only if that capability's base is actually
+ * the base of an allocation, as confirmed by usable_malloc_size), we guarantee
+ * that for each freed allocation, allocated_size will have beenincremented by
+ * at least as much as quarantine_size gets incremented. this is important
+ * because quarantine_size gets subtracted from allocated_size. if the above
+ * guarantee did not hold, an attacker could make allocated_size go negative
+ * and prevent sweeps from taking place (this still does not allow heap aliasing).
+ *
+ * we could alternatively call malloc_usable_size during allocation and free to
+ * make sure the same number is being added to allocated_size and
+ * quarantine_size, but this adds a slight additional cost to allocation.
+ * perhaps worth it.
+ *
+ * in the current code it is still possible for an attacker to inflate
+ * quarantine_size by repeatedly freeing the same legitimately allocated
+ * pointer. one solution to this is to paint the bitmap as each allocation is
+ * freed, and only report the painting as a success if the region of the bitmap
+ * is not already painted. this might slightly increase the cost of painting
+ * and lessen the benefit of the offload thread. another possible solution is
+ * to detect when allocated_size goes negative and take some appropriate
+ * action, but more thought is needed there.
+ */
+static inline void increment_allocated_size(void *allocated) {
+	allocated_size += cheri_getlen(allocated);
+	if (allocated_size > max_allocated_size) {
+		max_allocated_size = allocated_size;
+	}
+}
+
+/* just insert a freed allocation into a quarantine, no validation, increase quarantine size by length of allocation capability */
+static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr, size_t alloc_size) {
+	struct mrs_alloc_desc *ins = alloc_alloc_desc(ptr, alloc_size); // TODO XXX HANDLE SLABS ETC AND MAYBE ERRORS
+	ins->next = quarantine->list;
+	quarantine->list = ins;
+
+	quarantine->size += cheri_getlen(ptr); // TODO knob for incrementing quarantine size by underlying allocation (need to do this on the allocation side too)
+	if (quarantine->size > quarantine->max_size) {
+		quarantine->max_size = quarantine->size;
+	}
+}
+
+/*
+ * given a pointer freed by the application, validate it by (1) checking that
+ * the pointer has an underlying allocation (was actually allocated by the
+ * allocator) and (2) using the bitmap painting function to make sure this
+ * pointer is valid and hasn't already been freed or revoked.
+ *
+ * returns the size of the underlying allocation if validation was successful,
+ * 0 otherwise.
+ *
+ * supports ablation study knobs, returning 0 in case of a short circuit.
+ *
+ */
+static inline size_t validate_freed_pointer(void *ptr) {
+
+	/*
+	 * untagged check before malloc_allocation_size() catches NULL and other invalid
+	 * caps that may cause a rude implementation of malloc_allocation_size() to crash.
+	 */
+	if (!cheri_gettag(ptr)) {
+		mrs_debug_printf("validate_freed_pointer: untagged capability\n");
+		return 0;
+	}
+
+	size_t alloc_size = malloc_allocation_size(ptr);
+	if (alloc_size == 0) {
+		mrs_debug_printf("validate_freed_pointer: not allocated by underlying allocator\n");
+		return 0;
+	}
+
+#ifdef JUST_BOOKKEEPING
+	real_free(ptr);
+	return 0;
+#endif /* JUST_BOOKKEEPING */
+
+	/*
+	 * here we use the bitmap to synchronize and make sure that our guarantee is
+	 * upheld in multithreaded environments. we paint the bitmap to signal to the
+	 * kernel what needs to be revoked, but we also gate the operation of bitmap
+	 * painting, so that we can only successfully paint the bitmap for some freed
+	 * allocation (and let that allocation pass onto the quarantine list) if it
+	 * is legitimately allocated on the heap, not revoked, and not previously
+	 * queued for revocation, at the time of painting.
+	 *
+	 * essentially at this point we don't want something to end up on the
+	 * quarantine list twice. if that were to happen, we wouldn't be upholding
+	 * the principle that prevents heap aliasing.
+	 *
+	 * we can't allow a capability to pass painting and end up on the quarantine
+	 * list if its region of the bitmap is already painted. if that were to
+	 * happen, the two quarantine list entries corresponding to that region would
+	 * be freed non-atomically, such that we could observe one being freed, the
+	 * allocator reallocating the region, then the other being freed <! ERROR !>
+	 *
+	 * we also can't allow a previously revoked capability to pass painting and
+	 * end up on the quarantine list. if that were to happen, we could observe:
+	 *
+	 * ptr mrs_freed -> painted in bitmap -> added to quarantine -> revoked ->
+	 * cleared in bitmap -> /THREAD SWITCH/ revoked ptr mrs_freed -> painted in
+	 * bitmap -> revoked again -> cleared in bitmap -> freed back to allocator ->
+	 * reused /THREAD SWITCH BACK/ -> freed back to allocator <! ERROR !>
+	 *
+	 * similarly for untagged capabilities, because then a malicious user could
+	 * just construct a capability that takes the place of revoked ptr (i.e. same
+	 * address) above.
+	 *
+	 * we block these behaviors with a bitmap painting function that takes in a
+	 * user pointer and the full length of the allocation. it will only succeed
+	 * if, atomically at the time of painting, (1) the bitmap region is not
+	 * painted (2) the user pointer is tagged (3) the user pointer is not
+	 * revoked. if the painting function fails, we short-circuit and do not add
+	 * allocation to quarantine.
+	 *
+	 * we can clear the bitmap after revocation and before freeing back to the
+	 * allocator, which "opens" the gate for revocation of that region to occur
+	 * again. it's fine for clearing not to be atomic with freeing back to the
+	 * allocator, though, because between revocation and the allocator
+	 * reallocating the region, the user does not have any valid capabilities to
+	 * the region by definition.
+	 */
+
+#if !defined(JUST_QUARANTINE)
+	/* doesn't matter whether alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
+	if (caprev_shadow_nomap_set_len(entire_shadow, cheri_getbase(ptr), __builtin_align_up(alloc_size, CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
+		mrs_debug_printf("validate_freed_pointer: setting bitmap failed\n");
+		return 0;
+	}
+#endif /* !JUST_QUARANTINE */
+
+	return alloc_size;
+}
+
+static inline bool quarantine_should_flush(struct mrs_quarantine *quarantine) {
+#if defined(QUARANTINE_HIGHWATER)
+
+	return (quarantine->size >= QUARANTINE_HIGHWATER);
+
+#else /* QUARANTINE_HIGHWATER */
+
+#if !defined(QUARANTINE_RATIO)
+#  define QUARANTINE_RATIO 4
+#endif /* !QUARANTINE_RATIO */
+
+	return ((allocated_size >= MIN_REVOKE_HEAP_SIZE) && ((quarantine->size * QUARANTINE_RATIO) >= allocated_size));
+
+#endif /* !QUARANTINE_HIGHWATER */
+}
+
+/*
+ * perform revocation then iterate through the quarantine and free entries with
+ * non-zero underlying size (offload thread sets unvalidated caps to have zero
+ * size).
+ *
+ * supports ablation study knobs.
+ */
+static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
+#if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
+	atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
+	caprevoke_epoch start_epoch = cri->epoch_enqueue;
+	struct caprevoke_stats crst;
+#ifdef CONCURRENT_REVOCATION_PASS
+	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC);
+#else /* CONCURRENT_REVOCATION_PASS */
+	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
+#endif /* !CONCURRENT_REVOCATION_PASS */
+	while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
+		caprevoke(MRS_CAPREVOKE_FLAGS, start_epoch, &crst);
+	}
+#endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
+
+	struct mrs_alloc_desc *iter = quarantine->list, *prev;
+	while (iter != NULL) {
+		if (iter->alloc_size != 0) { // TODO can put this behind an ifdef offload
+#if !defined(JUST_QUARANTINE)
+			/* doesn't matter if alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
+			caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->allocated_region), __builtin_align_up(iter->alloc_size, CAPREVOKE_BITMAP_ALIGNMENT));
+			atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
+#endif /* !JUST_QUARANTINE */
+			/* this will be a revoked capability, which the allocator must accept */
+			real_free(iter->allocated_region);
+		}
+		prev = iter;
+		iter = iter->next;
+	}
+
+	/* free the quarntined descriptors */
+#ifndef OFFLOAD_QUARANTINE
+	prev->next = free_alloc_descs;
+	free_alloc_descs = quarantine->list;
+#else /* !OFFLOAD_QUARANTINE */
+	struct mrs_alloc_desc *flist_head = free_alloc_descs;
+	do {
+		prev->next = flist_head;
+	} while (!atomic_compare_exchange_weak(&free_alloc_descs, &flist_head, quarantine->list));
+#endif /* OFFLOAD_QUARANTINE */
+
+	quarantine->list = NULL;
+	allocated_size -= quarantine->size;
+	quarantine->size = 0;
+}
+
 /* constructor and destructor */
 
 __attribute__((constructor))
@@ -322,6 +497,8 @@ static void init(void) {
 	initialize_lock(printf_lock);
 
 #ifdef OFFLOAD_QUARANTINE
+	initialize_lock(offload_quarantine_lock);
+
 	pthread_t thd;
 	if (pthread_create(&thd, NULL, mrs_offload_thread, NULL)) {
 		mrs_printf("pthread error\n");
@@ -350,7 +527,7 @@ static void init(void) {
 #ifdef PRINT_STATS
 __attribute__((destructor))
 static void fini(void) {
-	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, quarantine_size, max_quarantine_size);
+// TODO 	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, quarantine_size, max_quarantine_size);
 }
 #endif /* PRINT_STATS */
 
@@ -398,7 +575,8 @@ static void *mrs_malloc(size_t size) {
 	 * clearing allocations could be done after revocation on free (and thus be
 	 * offloaded), but others report that zeroing the memory and bringing it into
 	 * the cache just before allocation results in a performance improvement on
-	 * some platforms, even if not on ours.
+	 * some platforms, even if not on ours. TODO ask David about heuristics for
+	 * this
 	 *
 	 * for revocation, clearing in the free function (but after revocation) may
 	 * slightly reduce the cost of sweeping in later passes by reducing the
@@ -444,6 +622,7 @@ void *mrs_calloc(size_t number, size_t size) {
 	return real_calloc(number, size);
 #endif /* JUST_INTERPOSE */
 
+	/* this causes problems if our library is initizlied before the thread library */
 	/*mrs_debug_printf("mrs_calloc: called\n");*/
 
 	if (number == 0 || size == 0) {
@@ -569,84 +748,13 @@ static void mrs_free(void *ptr) {
 
 	mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
-	/*
-	 * short circuit if the passed-in pointer is untagged or if its base does not
-	 * correspond to an allocation. otherwise, get the size of the full
-	 * underlying allocation for bitmap painting (as opposed to the length of the
-	 * passed-in pointer, which is user-controlled and may not overlap with all
-	 * possible pointers derived from the initial allocation). use an untagged
-	 * check rather than == NULL because it catches the NULL capability as well
-	 * as others that might cause rude malloc_allocation_size implementations
-	 * to crash.
-	 */
-	if (!cheri_gettag(ptr)) {
-		mrs_debug_printf("mrs_free: untagged capability\n");
-		return;
-	}
-	size_t alloc_size = malloc_allocation_size(ptr);
+	size_t alloc_size = validate_freed_pointer(ptr);
 	if (alloc_size == 0) {
-		mrs_debug_printf("mrs_free: not allocated by underlying allocator\n");
+		mrs_debug_printf("mrs_free: validation failed\n");
 		return;
 	}
 
-#ifdef JUST_BOOKKEEPING
-	return real_free(ptr);
-#endif /* JUST_BOOKKEEPING */
-
-	/*
-	 * here we use the bitmap to synchronize and make sure that our guarantee is
-	 * upheld in multithreaded environments. we paint the bitmap to signal to the
-	 * kernel what needs to be revoked, but we also gate the operation of bitmap
-	 * painting, so that we can only successfully paint the bitmap for some freed
-	 * allocation (and let that allocation pass onto the quarantine list) if it
-	 * is legitimately allocated on the heap, not revoked, and not previously
-	 * queued for revocation, at the time of painting.
-	 *
-	 * essentially at this point we don't want something to end up on the
-	 * quarantine list twice. if that were to happen, we wouldn't be upholding
-	 * the principle that prevents heap aliasing.
-	 *
-	 * we can't allow a capability to pass painting and end up on the quarantine
-	 * list if its region of the bitmap is already painted. if that were to
-	 * happen, the two quarantine list entries corresponding to that region would
-	 * be freed non-atomically, such that we could observe one being freed, the
-	 * allocator reallocating the region, then the other being freed <! ERROR !>
-	 *
-	 * we also can't allow a previously revoked capability to pass painting and
-	 * end up on the quarantine list. if that were to happen, we could observe:
-	 *
-	 * ptr mrs_freed -> painted in bitmap -> added to quarantine -> revoked ->
-	 * cleared in bitmap -> /THREAD SWITCH/ revoked ptr mrs_freed -> painted in
-	 * bitmap -> revoked again -> cleared in bitmap -> freed back to allocator ->
-	 * reused /THREAD SWITCH BACK/ -> freed back to allocator <! ERROR !>
-	 *
-	 * similarly for untagged capabilities, because then a malicious user could
-	 * just construct a capability that takes the place of revoked ptr (i.e. same
-	 * address) above.
-	 *
-	 * we block these behaviors with a bitmap painting function that takes in a
-	 * user pointer and the full length of the allocation. it will only succeed
-	 * if, atomically at the time of painting, (1) the bitmap region is not
-	 * painted (2) the user pointer is tagged (3) the user pointer is not
-	 * revoked. if the painting function fails, we short-circuit and do not add
-	 * allocation to quarantine.
-	 *
-	 * we can clear the bitmap after revocation and before freeing back to the
-	 * allocator, which "opens" the gate for revocation of that region to occur
-	 * again. it's fine for clearing not to be atomic with freeing back to the
-	 * allocator, though, because between revocation and the allocator
-	 * reallocating the region, the user does not have any valid capabilities to
-	 * the region by definition.
-	 */
-
-#if !defined(JUST_QUARANTINE)
-	/* doesn't matter whether alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-	if (caprev_shadow_nomap_set_len(entire_shadow, cheri_getbase(ptr), __builtin_align_up(alloc_size, CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
-		mrs_debug_printf("mrs_free: setting bitmap failed\n");
-		return;
-	}
-#endif /* !JUST_QUARANTINE */
-
+	// TODO refactor and also include in the offload case
 #ifdef BYPASS_QUARANTINE
 	/*
 	 * if this is a full-page(s) allocation, bypass the quarantine by
@@ -664,111 +772,89 @@ static void mrs_free(void *ptr) {
 			((region_size & (page_size - 1)) == 0)) {
 		mrs_debug_printf("mrs_free: page-multiple free, bypassing quarantine\n");
 		/*real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE);*/
-		return;
+		return 0;
 	}
 #endif /* BYPASS_QUARANTINE */
 
-	/* add the allocation to quarantine */
-	struct mrs_alloc_desc *alloc = alloc_alloc_desc(ptr, alloc_size);
-	alloc->next = quarantine;
-	quarantine = alloc;
-	increment_quarantine_size(alloc->allocated_region);
+	quarantine_insert(&quarantine, ptr, alloc_size);
 
-	bool should_revoke;
-
-#if defined(QUARANTINE_HIGHWATER)
-	should_revoke = (quarantine_size >= QUARANTINE_HIGHWATER);
-#else /* QUARANTINE_HIGHWATER */
-
-#if !defined(QUARANTINE_RATIO)
-#  define QUARANTINE_RATIO 4
-#endif /* !QUARANTINE_RATIO */
-
-	should_revoke = ((allocated_size >= MIN_REVOKE_HEAP_SIZE) && ((quarantine_size * QUARANTINE_RATIO) >= allocated_size));
-
-#endif /* !QUARANTINE_HIGHWATER */
-
-	if (should_revoke) {
-		mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine_size);
-
-#if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
-		atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
-		caprevoke_epoch start_epoch = cri->epoch_enqueue;
-		struct caprevoke_stats crst;
-#ifdef CONCURRENT_REVOCATION_PASS
-		const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC);
-#else /* CONCURRENT_REVOCATION_PASS */
-		const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
-#endif /* !CONCURRENT_REVOCATION_PASS */
-		while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
-			caprevoke(MRS_CAPREVOKE_FLAGS, start_epoch, &crst);
-		}
-#endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
-
-		struct mrs_alloc_desc *iter = quarantine, *prev;
-		while (iter != NULL) {
-#if !defined(JUST_QUARANTINE)
-			/* doesn't matter if alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-			caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->allocated_region), __builtin_align_up(iter->alloc_size, CAPREVOKE_BITMAP_ALIGNMENT));
-			atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
-#endif /* !JUST_QUARANTINE */
-			/* this will be a revoked capability, which the allocator must accept */
-			real_free(iter->allocated_region);
-			prev = iter;
-			iter = iter->next;
-		}
-
-		/* free the quarntined descriptors */
-#ifndef OFFLOAD_QUARANTINE
-		prev->next = free_alloc_descs;
-		free_alloc_descs = quarantine;
-#else /* !OFFLOAD_QUARANTINE */
-		struct mrs_alloc_desc *flist_head = free_alloc_descs;
-		do {
-			prev->next = flist_head;
-		} while (!atomic_compare_exchange_weak(&free_alloc_descs, &flist_head, quarantine));
-#endif /* OFFLOAD_QUARANTINE */
-
-		quarantine = NULL;
-		allocated_size -= quarantine_size;
-		quarantine_size = 0;
+	if (quarantine_should_flush(&quarantine)) {
+		mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine.size);
+		quarantine_flush(&quarantine);
 	}
 }
 
 #ifdef OFFLOAD_QUARANTINE
+/*
+ * we trigger a revocation pass when the unvalidated quarantine hits the
+ * highwater mark because if we waited until the validated queue passed the
+ * highwater mark, the allocated size might increase (allocations made) between
+ * the unvalidated queue and validated queue filling such that the high water
+ * mark is no longer hit. this function just fills up the unvalidated
+ * quarantine and passes it off when it's full. with offload enabled,
+ * the "quarantine" global is unvalidated and passed off to the
+ * "offload_quarantine" global then processed in place (list entries that fail
+ * validation are not processed).
+ */
 static void mrs_free_offload(void *ptr) {
-	/* this descriptor hasn't been validated */
-	struct mrs_alloc_desc *freed = alloc_alloc_desc(ptr, 0);
-	struct mrs_alloc_desc *front = offloaded_descs;
-	do {
-		freed->next = front;
-	} while (!atomic_compare_exchange_weak(&offloaded_descs, &front, freed));
+	mrs_debug_printf("mrs_free_offload: called address %p\n", ptr);
+
+	/* use alloc_size of 0 to indicate unvalidated descriptor */
+quarantine_insert(&quarantine, ptr, 0);
+
+if (quarantine_should_flush(&quarantine)) {
+		mrs_printf("mrs_free_offload: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine.size);
+		mrs_lock(&offload_quarantine_lock);
+		while (offload_quarantine.list != NULL) {
+			mrs_debug_printf("mrs_free_offload: waiting for offload_quarantine to drain\n");
+			if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
+				mrs_printf("pthread error\n");
+				exit(7);
+			}
+		}
+		mrs_debug_printf("mrs_free_offload: offload_quarantine drained\n");
+
+		offload_quarantine.list = quarantine.list;
+		offload_quarantine.size = quarantine.size;
+		quarantine.list = NULL;
+		quarantine.size = 0;
+
+		mrs_unlock(&offload_quarantine_lock);
+		if (pthread_cond_signal(&offload_quarantine_ready)) {
+			mrs_printf("pthread error\n");
+			exit(7);
+		}
+	}
 }
 
 static void *mrs_offload_thread(void *arg) {
-	struct mrs_alloc_desc *front;
-	int empty_cnt = 0;
-
-	/* XXX this only works with a single consumer */
 	for (;;) {
-		front = offloaded_descs;
-		if (front == NULL) {
-			empty_cnt++;
-			if (empty_cnt == 64) {
-				sched_yield();
-				empty_cnt = 0;
+		mrs_lock(&offload_quarantine_lock);
+		while (offload_quarantine.list == NULL) {
+			mrs_debug_printf("mrs_offload_thread: waiting for offload_quarantine to be ready\n");
+			if (pthread_cond_wait(&offload_quarantine_ready, &offload_quarantine_lock)) {
+				mrs_printf("pthread error\n");
+				exit(7);
 			}
-		} else {
-			empty_cnt = 0;
-			while (!atomic_compare_exchange_weak(&offloaded_descs, &front, front->next)) {
-				continue;
+		}
+		mrs_debug_printf("mrs_offload_thread: offload_quarantine ready\n");
+
+		/* iterate through the quarantine validating the freed pointers. alloc_size of 0 means invalid. */
+		for (struct mrs_alloc_desc *iter = offload_quarantine.list; iter != NULL; iter = iter->next) {
+			iter->alloc_size = validate_freed_pointer(iter->allocated_region);
+			/* if the pointer was invalid, don't include it in the size calculation */
+			if (iter->alloc_size == 0) {
+				// TODO can use underlying alloc size if knob is set
+				offload_quarantine.size -= cheri_getlen(iter->allocated_region);
 			}
-			mrs_free(front->allocated_region);
-			/* XXX free alloc desc used to send the freed pointer to offload - reused code */
-			struct mrs_alloc_desc *flist_head = free_alloc_descs;
-			do {
-				front->next = flist_head;
-			} while (!atomic_compare_exchange_weak(&free_alloc_descs, &flist_head, front));
+		}
+
+		quarantine_flush(&offload_quarantine);
+
+		mrs_unlock(&offload_quarantine_lock); // TODO don't need to release this lock then acquire it again immediately
+		if (pthread_cond_signal(&offload_quarantine_empty)) {
+				mrs_printf("pthread error\n");
+				exit(7);
 		}
 	}
 }
