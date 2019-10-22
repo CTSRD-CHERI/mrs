@@ -74,8 +74,6 @@
 
 /* functions */
 
-#define cheri_testsubset(x, y) __builtin_cheri_subset_test((x), (y)) // TODO add to cheric.h
-
 static void *mrs_malloc(size_t);
 static void mrs_free(void *);
 #ifdef OFFLOAD_QUARANTINE
@@ -86,7 +84,6 @@ static void *mrs_realloc(void *, size_t);
 static int mrs_posix_memalign(void **, size_t, size_t);
 static void *mrs_aligned_alloc(size_t, size_t);
 
-/* TODO malloc = mrs_malloc*/
 void *malloc(size_t size) {
 	return mrs_malloc(size);
 }
@@ -114,33 +111,37 @@ size_t malloc_allocation_size(void *) __attribute__((weak));
 
 /* globals */
 
-struct mrs_quarantine {
-	size_t size;
-	size_t max_size;
-	struct mrs_alloc_desc *list;
-};
-
-// TODO investigate replacing with linked list of arrays, remove internal calls to mrs functions
-struct mrs_alloc_desc {
-	void *allocated_region;
-	size_t alloc_size; /* this is the actual size of the container underlying the allocation, may be different than cheri_getlen() of the region */
-	struct mrs_alloc_desc *next;
-};
-
-static size_t page_size;
 /* alignment requirement for allocations so they can be painted in the caprevoke bitmap */
-static const size_t CAPREVOKE_BITMAP_ALIGNMENT = sizeof(void *); // TODO VM_CAPREVOKE_GSZ_MEM_NOMAP from machine/vmparam.h
-static const size_t NEW_DESCRIPTOR_BATCH_SIZE = 10000;
+static const size_t CAPREVOKE_BITMAP_ALIGNMENT = sizeof(void *); /* XXX VM_CAPREVOKE_GSZ_MEM_NOMAP from machine/vmparam.h */
+static const size_t DESCRIPTOR_SLAB_ENTRIES = 10000;
 static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
 volatile const struct caprevoke_info *cri;
+static size_t page_size;
 static void *entire_shadow;
 
+struct mrs_allocation_info {
+	void *freed_ptr;
+	size_t underlying_size;
+};
+
+struct mrs_descriptor_slab {
+	int num_descriptors;
+	struct mrs_descriptor_slab *next;
+	struct mrs_allocation_info slab[DESCRIPTOR_SLAB_ENTRIES];
+};
+
+struct mrs_quarantine {
+	size_t size;
+	size_t max_size;
+	struct mrs_descriptor_slab *list;
+};
+
 #ifndef OFFLOAD_QUARANTINE
-static struct mrs_alloc_desc * free_alloc_descs;
+static struct mrs_descriptor_slab *free_descriptor_slabs;
 #else /* !OFFLOAD_QUARANTINE */
-// XXX false sharing, ABA, etc... switch to library
-static struct mrs_alloc_desc * _Atomic free_alloc_descs;
+/* XXX ABA and other issues ... should switch to atomics library */
+static struct mrs_descriptor_slab * _Atomic free_descriptor_slabs;
 #endif /* OFFLOAD_QUARANTINE */
 
 static size_t allocated_size; /* amount of memory that the allocator views as allocated (includes quarantine) */
@@ -214,77 +215,34 @@ void _putchar(char character) {
 
 /* utilities */
 
-static struct mrs_alloc_desc *alloc_alloc_desc(void *allocated_region, size_t alloc_size) {
-
-#ifndef OFFLOAD_QUARANTINE
-	struct mrs_alloc_desc *ret;
-
-	if (free_alloc_descs != NULL) {
-		ret = free_alloc_descs;
-		free_alloc_descs = free_alloc_descs->next;
-
+static struct mrs_descriptor_slab *alloc_descriptor_slab() {
+	if (free_descriptor_slabs == NULL) {
+		mrs_debug_printf("alloc_descriptor_slab: mapping new memory\n");
+		struct mrs_descriptor_slab *ret = (struct mrs_descriptor_slab *)mmap(NULL, sizeof(struct mrs_descriptor_slab), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
+		return (ret == MAP_FAILED) ? NULL : ret;
 	} else {
-		mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
-		struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
-		if (new_descs == MAP_FAILED) {
-			return NULL;
-		}
-		for (int i = 0; i < NEW_DESCRIPTOR_BATCH_SIZE - 2; i++) {
-			new_descs[i].next = &new_descs[i + 1];
-		}
-		ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
-		new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = free_alloc_descs;
-		free_alloc_descs = new_descs;
+		mrs_debug_printf("alloc_descriptor_slab: reusing memory\n");
+		struct mrs_descriptor_slab *ret = free_descriptor_slabs;
+
+#ifdef OFFLOAD_QUARANTINE
+		while (!atomic_compare_exchange_weak(&free_descriptor_slabs, &ret, ret->next));
+#else /* OFFLOAD_QUARANTINE */
+		free_descriptor_slabs = free_descriptor_slabs->next;
+#endif /* !OFFLOAD_QUARANTINE */
+
+		ret->num_descriptors = 0;
+		return ret;
 	}
-
-	ret->alloc_size = alloc_size;
-	ret->allocated_region = allocated_region;
-	return ret;
-
-#else /* !OFFLOAD_QUARANTINE */
-
-	struct mrs_alloc_desc *ret;
-
-	/*
-	 * XXX this should work even with additional consumers, which we don't have
-	 * in practice. can move the if (ret == NULL) check out of the do-while.
-	 */
-	ret = free_alloc_descs;
-	do {
-		if (ret == NULL) {
-			mrs_debug_printf("alloc_alloc_desc: mapping new memory\n");
-			struct mrs_alloc_desc *new_descs = (struct mrs_alloc_desc *)mmap(NULL, NEW_DESCRIPTOR_BATCH_SIZE * sizeof(struct mrs_alloc_desc), PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
-			if (new_descs == MAP_FAILED) {
-				return NULL;
-			}
-			for (int i = 0; i < NEW_DESCRIPTOR_BATCH_SIZE - 2; i++) {
-				new_descs[i].next = &new_descs[i + 1];
-			}
-			ret = &new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 1];
-
-			struct mrs_alloc_desc *ins = free_alloc_descs;
-			do {
-				new_descs[NEW_DESCRIPTOR_BATCH_SIZE - 2].next = ins;
-			} while (!atomic_compare_exchange_weak(&free_alloc_descs, &ins, new_descs));
-			break;
-		}
-	} while (!atomic_compare_exchange_weak(&free_alloc_descs, &ret, ret->next));
-
-	ret->alloc_size = alloc_size;
-	ret->allocated_region = allocated_region;
-	return ret;
-
-#endif /* OFFLOAD_QUARANTINE */
 }
 
 /*
- * TODO:
+ * TODO knob for underlying allocation
  * we assume that the consumer of this shim can issue arbitrary malicious
  * malloc/free calls. by using the length of the capability returned from
  * malloc to increment allocated size and the capability given back by the user
  * to increment the quarantine size (only if that capability's base is actually
  * the base of an allocation, as confirmed by usable_malloc_size), we guarantee
- * that for each freed allocation, allocated_size will have beenincremented by
+ * that for each freed allocation, allocated_size will have been incremented by
  * at least as much as quarantine_size gets incremented. this is important
  * because quarantine_size gets subtracted from allocated_size. if the above
  * guarantee did not hold, an attacker could make allocated_size go negative
@@ -313,9 +271,21 @@ static inline void increment_allocated_size(void *allocated) {
 
 /* just insert a freed allocation into a quarantine, no validation, increase quarantine size by length of allocation capability */
 static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr, size_t alloc_size) {
-	struct mrs_alloc_desc *ins = alloc_alloc_desc(ptr, alloc_size); // TODO XXX HANDLE SLABS ETC AND MAYBE ERRORS
-	ins->next = quarantine->list;
-	quarantine->list = ins;
+
+	if (quarantine->list == NULL || quarantine->list->num_descriptors == DESCRIPTOR_SLAB_ENTRIES) {
+		struct mrs_descriptor_slab *ins = alloc_descriptor_slab();
+		if (ins == NULL) {
+			mrs_printf("quarantine_insert: couldn't allocate new descriptor slab\n");
+			exit(7);
+		}
+		ins->next = quarantine->list;
+		quarantine->list = ins;
+	}
+
+	quarantine->list->slab[quarantine->list->num_descriptors].freed_ptr = ptr;
+	quarantine->list->slab[quarantine->list->num_descriptors].underlying_size = alloc_size;
+
+	quarantine->list->num_descriptors++;
 
 	quarantine->size += cheri_getlen(ptr); // TODO knob for incrementing quarantine size by underlying allocation (need to do this on the allocation side too)
 	if (quarantine->size > quarantine->max_size) {
@@ -452,31 +422,36 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 	}
 #endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
 
-	struct mrs_alloc_desc *iter = quarantine->list, *prev;
-	while (iter != NULL) {
-		if (iter->alloc_size != 0) { // TODO can put this behind an ifdef offload
+	struct mrs_descriptor_slab *prev = NULL;
+	for (struct mrs_descriptor_slab *iter = quarantine->list; iter != NULL; iter = iter->next) {
+		for (int i = 0; i < iter->num_descriptors; i++) {
+			/* in the offload case, only clear the bitmap for validated descriptors (underlying_size != 0) */
+#ifdef OFFLOAD_QUARANTINE
+			if (iter->slab[i].underlying_size != 0) {
+#endif /* OFFLOAD_QUARANTINE */
+
 #if !defined(JUST_QUARANTINE)
-			/* doesn't matter if alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-			caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->allocated_region), __builtin_align_up(iter->alloc_size, CAPREVOKE_BITMAP_ALIGNMENT));
-			atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
+				/* doesn't matter if underlying_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
+				caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->slab[i].freed_ptr), __builtin_align_up(iter->slab[i].underlying_size, CAPREVOKE_BITMAP_ALIGNMENT));
+				atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
-			/* this will be a revoked capability, which the allocator must accept */
-			real_free(iter->allocated_region);
+				/* this will be a revoked capability, which the allocator must accept */
+				real_free(iter->slab[i].freed_ptr);
+
+#ifdef OFFLOAD_QUARANTINE
+			}
+#endif /* OFFLOAD_QUARANTINE */
 		}
 		prev = iter;
-		iter = iter->next;
 	}
 
-	/* free the quarntined descriptors */
-#ifndef OFFLOAD_QUARANTINE
-	prev->next = free_alloc_descs;
-	free_alloc_descs = quarantine->list;
-#else /* !OFFLOAD_QUARANTINE */
-	struct mrs_alloc_desc *flist_head = free_alloc_descs;
-	do {
-		prev->next = flist_head;
-	} while (!atomic_compare_exchange_weak(&free_alloc_descs, &flist_head, quarantine->list));
-#endif /* OFFLOAD_QUARANTINE */
+	/* free the quarantined descriptors */
+	prev->next = free_descriptor_slabs;
+#ifdef OFFLOAD_QUARANTINE
+	while (!atomic_compare_exchange_weak(&free_descriptor_slabs, &prev->next, quarantine->list));
+#else /* OFFLOAD_QUARANTINE */
+	free_descriptor_slabs = quarantine->list;
+#endif /* !OFFLOAD_QUARANTINE */
 
 	quarantine->list = NULL;
 	allocated_size -= quarantine->size;
@@ -527,7 +502,11 @@ static void init(void) {
 #ifdef PRINT_STATS
 __attribute__((destructor))
 static void fini(void) {
-// TODO 	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, quarantine_size, max_quarantine_size);
+#ifdef OFFLOAD_QUARANTINE
+	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, offload_quarantine.size, offload_quarantine.max_size);
+#else /* OFFLOAD_QUARANTINE */
+	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, quarantine.size, quarantine.max_size);
+#endif /* !OFFLOAD_QUARANTINE */
 }
 #endif /* PRINT_STATS */
 
@@ -772,7 +751,7 @@ static void mrs_free(void *ptr) {
 			((region_size & (page_size - 1)) == 0)) {
 		mrs_debug_printf("mrs_free: page-multiple free, bypassing quarantine\n");
 		/*real_madvise(alloc_desc->vmmap_cap, region_size, MADV_FREE);*/
-		return 0;
+		return;
 	}
 #endif /* BYPASS_QUARANTINE */
 
@@ -828,8 +807,8 @@ if (quarantine_should_flush(&quarantine)) {
 }
 
 static void *mrs_offload_thread(void *arg) {
+	mrs_lock(&offload_quarantine_lock);
 	for (;;) {
-		mrs_lock(&offload_quarantine_lock);
 		while (offload_quarantine.list == NULL) {
 			mrs_debug_printf("mrs_offload_thread: waiting for offload_quarantine to be ready\n");
 			if (pthread_cond_wait(&offload_quarantine_ready, &offload_quarantine_lock)) {
@@ -840,18 +819,20 @@ static void *mrs_offload_thread(void *arg) {
 		mrs_debug_printf("mrs_offload_thread: offload_quarantine ready\n");
 
 		/* iterate through the quarantine validating the freed pointers. alloc_size of 0 means invalid. */
-		for (struct mrs_alloc_desc *iter = offload_quarantine.list; iter != NULL; iter = iter->next) {
-			iter->alloc_size = validate_freed_pointer(iter->allocated_region);
-			/* if the pointer was invalid, don't include it in the size calculation */
-			if (iter->alloc_size == 0) {
-				// TODO can use underlying alloc size if knob is set
-				offload_quarantine.size -= cheri_getlen(iter->allocated_region);
+		for (struct mrs_descriptor_slab *iter = offload_quarantine.list; iter != NULL; iter = iter->next) {
+			for (int i = 0; i < iter->num_descriptors; i++) {
+				iter->slab[i].underlying_size = validate_freed_pointer(iter->slab[i].freed_ptr);
+
+				/* if the pointer was invalid, don't include it in the size calculation */
+				if (iter->slab[i].underlying_size == 0) {
+					// TODO can use underlying alloc size if knob is set
+					offload_quarantine.size -= cheri_getlen(iter->slab[i].freed_ptr);
+				}
 			}
 		}
 
 		quarantine_flush(&offload_quarantine);
 
-		mrs_unlock(&offload_quarantine_lock); // TODO don't need to release this lock then acquire it again immediately
 		if (pthread_cond_signal(&offload_quarantine_empty)) {
 				mrs_printf("pthread error\n");
 				exit(7);
@@ -859,21 +840,3 @@ static void *mrs_offload_thread(void *arg) {
 	}
 }
 #endif /* OFFLOAD_QUARANTINE */
-
-/* TODO:
- *
- * #if !defined(__FreeBSD__) && !defined(__OpenBSD__) reallocarray #endif
- *
- * memalign
- *
- * #if !defined(__FreeBSD__) && !defined(__OpenBSD__) valloc #endif
- *
- * mallctl
- *
- *   required to work before TLS is set up in statically linked programs
- * #if !defined(__PIC__) && !defined(NO_BOOTSTRAP_ALLOCATOR)
- *   __je_bootstrap_malloc
- *   __je_bootstrap_calloc
- *   __je_bootstrap_free
- * #endif
- */
