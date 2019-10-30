@@ -689,8 +689,7 @@ static void *mrs_aligned_alloc(size_t alignment, size_t size) {
 /*
  * replace realloc with a malloc and free to avoid dangling pointers in case of
  * in-place realloc that shrinks the buffer. if ptr is not a real allocation,
- * mrs_free() won't free it, but its buffer will still get copied into a new
- * allocation.
+ * its buffer will still get copied into a new allocation.
  */
 static void *mrs_realloc(void *ptr, size_t size) {
 
@@ -702,7 +701,7 @@ static void *mrs_realloc(void *ptr, size_t size) {
 	mrs_debug_printf("mrs_realloc: called ptr %p ptr size %zu new size %zu\n", ptr, old_size, size);
 
 	if (size == 0) {
-		mrs_free(ptr);
+		free(ptr);
 		return NULL;
 	}
 
@@ -716,7 +715,7 @@ static void *mrs_realloc(void *ptr, size_t size) {
 		return NULL;
 	}
 	memcpy(new_alloc, ptr, size < old_size ? size : old_size);
-	mrs_free(ptr);
+	free(ptr);
 	return new_alloc;
 }
 
