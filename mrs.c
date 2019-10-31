@@ -40,6 +40,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -57,6 +58,7 @@
  * OFFLOAD_QUARANTINE: process full quarantines in a separate thread
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
+ * PRINT_CAPREVOKE: print stats for each caprevoke
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
  * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
  *
@@ -400,6 +402,55 @@ static inline bool quarantine_should_flush(struct mrs_quarantine *quarantine) {
 #endif /* !QUARANTINE_HIGHWATER */
 }
 
+#ifdef PRINT_CAPREVOKE
+static inline uint64_t
+caprevoke_get_cyc(void)
+{
+	uint64_t res;
+
+	__asm__ __volatile__ (
+		".set push\n.set noreorder\nrdhwr %0, $2\n.set pop"
+	      : "=r"(res));
+
+	return res;
+}
+
+static inline void
+print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
+{
+	mrs_printf("mrs caprevoke %s:"
+		" efin=%" PRIu64
+		" psrt=%" PRIu64
+		" psro=%" PRIu64
+		" psrw=%" PRIu64
+		" pfro=%" PRIu64
+		" pfrw=%" PRIu64
+		" pskf=%" PRIu64
+		" psks=%" PRIu64
+		" cfnd=%" PRIu64
+		" cfrv=%" PRIu64
+		" cnuk=%" PRIu64
+		" pcyc=%" PRIu64
+		" tcyc=%" PRIu64
+		"\n",
+		what,
+		crst->epoch_fini,
+		crst->pages_retried,
+		crst->pages_scan_ro,
+		crst->pages_scan_rw,
+		crst->pages_faulted_ro,
+		crst->pages_faulted_rw,
+		crst->pages_skip_fast,
+		crst->pages_skip,
+		crst->caps_found,
+		crst->caps_found_revoked,
+		crst->caps_cleared,
+		crst->page_scan_cycles,
+		cycles
+	);
+}
+#endif
+
 /*
  * perform revocation then iterate through the quarantine and free entries with
  * non-zero underlying size (offload thread sets unvalidated caps to have zero
@@ -412,13 +463,37 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 	atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
 	caprevoke_epoch start_epoch = cri->epoch_enqueue;
 	struct caprevoke_stats crst;
-#ifdef CONCURRENT_REVOCATION_PASS
-	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC);
-#else /* CONCURRENT_REVOCATION_PASS */
-	const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
-#endif /* !CONCURRENT_REVOCATION_PASS */
+
 	while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
+# ifdef PRINT_CAPREVOKE
+		uint64_t cyc_init, cyc_fini;
+
+#  ifdef CONCURRENT_REVOCATION_PASS
+		cyc_init = caprevoke_get_cyc();
+		caprevoke(CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
+		cyc_fini = caprevoke_get_cyc();
+		print_caprevoke_stats("initial", &crst, cyc_fini - cyc_init);
+		cyc_init = caprevoke_get_cyc();
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
+		cyc_fini = caprevoke_get_cyc();
+		print_caprevoke_stats("final", &crst, cyc_fini - cyc_init);
+#  else /* CONCURRENT_REVOCATION_PASS */
+		cyc_init = caprevoke_get_cyc();
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
+		cyc_fini = caprevoke_get_cyc();
+		print_caprevoke_stats("single", &crst, cyc_fini - cyc_init);
+#  endif /* !CONCURRENT_REVOCATION_PASS */
+
+# else /* PRINT_CAPREVOKE */
+
+#  ifdef CONCURRENT_REVOCATION_PASS
+		const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC);
+#  else /* CONCURRENT_REVOCATION_PASS */
+		const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
+#  endif /* !CONCURRENT_REVOCATION_PASS */
 		caprevoke(MRS_CAPREVOKE_FLAGS, start_epoch, &crst);
+# endif /* !PRINT_CAPREVOKE */
+
 	}
 #endif /* !JUST_QUARANTINE && !JUST_PAINT_BITMAP */
 
