@@ -77,8 +77,9 @@
 /* functions */
 
 static void *mrs_malloc(size_t);
+#ifndef OFFLOAD_QUARANTINE
 static void mrs_free(void *);
-#ifdef OFFLOAD_QUARANTINE
+#else /* !OFFLOAD_QUARANTINE */
 static void mrs_free_offload(void *);
 #endif /* OFFLOAD_QUARANTINE */
 static void *mrs_calloc(size_t, size_t);
@@ -149,9 +150,9 @@ static struct mrs_descriptor_slab * _Atomic free_descriptor_slabs;
 static size_t allocated_size; /* amount of memory that the allocator views as allocated (includes quarantine) */
 static size_t max_allocated_size;
 
-static struct mrs_quarantine quarantine;
+static struct mrs_quarantine application_quarantine; /* quarantine for the application thread */
 #ifdef OFFLOAD_QUARANTINE
-static struct mrs_quarantine offload_quarantine;
+static struct mrs_quarantine offload_quarantine; /* quarantine for the offload thread */
 #endif /* OFFLOAD_QUARANTINE */
 
 static void *mrs_calloc_bootstrap(size_t number, size_t size);
@@ -794,6 +795,8 @@ static void *mrs_realloc(void *ptr, size_t size) {
 	return new_alloc;
 }
 
+#ifndef OFFLOAD_QUARANTINE
+
 static void mrs_free(void *ptr) {
 #ifdef JUST_INTERPOSE
 	return real_free(ptr);
@@ -829,15 +832,16 @@ static void mrs_free(void *ptr) {
 	}
 #endif /* BYPASS_QUARANTINE */
 
-	quarantine_insert(&quarantine, ptr, alloc_size);
+	quarantine_insert(&application_quarantine, ptr, alloc_size);
 
-	if (quarantine_should_flush(&quarantine)) {
-		mrs_printf("mrs_free: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine.size);
-		quarantine_flush(&quarantine);
+	if (quarantine_should_flush(&application_quarantine)) {
+		mrs_printf("mrs_free: passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
+		quarantine_flush(&application_quarantine);
 	}
 }
 
-#ifdef OFFLOAD_QUARANTINE
+#else /* !OFFLOAD_QUARANTINE */
+
 /*
  * we trigger a revocation pass when the unvalidated quarantine hits the
  * highwater mark because if we waited until the validated queue passed the
@@ -853,10 +857,10 @@ static void mrs_free_offload(void *ptr) {
 	mrs_debug_printf("mrs_free_offload: called address %p\n", ptr);
 
 	/* use alloc_size of 0 to indicate unvalidated descriptor */
-quarantine_insert(&quarantine, ptr, 0);
+quarantine_insert(&application_quarantine, ptr, 0);
 
-if (quarantine_should_flush(&quarantine)) {
-		mrs_printf("mrs_free_offload: passed quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, quarantine.size);
+if (quarantine_should_flush(&application_quarantine)) {
+		mrs_printf("mrs_free_offload: passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
 		mrs_lock(&offload_quarantine_lock);
 		while (offload_quarantine.list != NULL) {
 			mrs_debug_printf("mrs_free_offload: waiting for offload_quarantine to drain\n");
@@ -867,10 +871,10 @@ if (quarantine_should_flush(&quarantine)) {
 		}
 		mrs_debug_printf("mrs_free_offload: offload_quarantine drained\n");
 
-		offload_quarantine.list = quarantine.list;
-		offload_quarantine.size = quarantine.size;
-		quarantine.list = NULL;
-		quarantine.size = 0;
+		offload_quarantine.list = application_quarantine.list;
+		offload_quarantine.size = application_quarantine.size;
+		application_quarantine.list = NULL;
+		application_quarantine.size = 0;
 
 		mrs_unlock(&offload_quarantine_lock);
 		if (pthread_cond_signal(&offload_quarantine_ready)) {
@@ -913,4 +917,5 @@ static void *mrs_offload_thread(void *arg) {
 		}
 	}
 }
+
 #endif /* OFFLOAD_QUARANTINE */
