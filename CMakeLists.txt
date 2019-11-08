@@ -36,6 +36,7 @@ option(OFFLOAD_QUARANTINE "process the quarantine in a separate worker thread" O
 option(BYPASS_QUARANTINE "MADV_FREE freed page-size allocations" OFF)
 option(CLEAR_ALLOCATIONS "zero out allocations made by malloc" OFF)
 option(CONCURRENT_REVOCATION_PASS "enable a concurrent revocation pass before the stop-the-world pass" OFF)
+option(REVOKE_ON_FREE "perform revocation on free rather than during allocation routines" OFF)
 
 option(JUST_INTERPOSE "just call the real functions" OFF)
 option(JUST_BOOKKEEPING "just update data structures then call the real functions" OFF)
@@ -69,6 +70,10 @@ endif()
 if(CONCURRENT_REVOCATION_PASS)
 	message("defining CONCURRENT_REVOCATION_PASS")
 	target_compile_definitions(mrs PRIVATE CONCURRENT_REVOCATION_PASS)
+endif()
+if(REVOKE_ON_FREE)
+	message("defining REVOKE_ON_FREE")
+	target_compile_definitions(mrs PRIVATE REVOKE_ON_FREE)
 endif()
 
 if(JUST_INTERPOSE)

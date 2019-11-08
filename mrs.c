@@ -61,6 +61,7 @@
  * PRINT_CAPREVOKE: print stats for each caprevoke
  * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
  * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
+ * REVOKE_ON_FREE: perform revocation on free rather than during allocation routines
  *
  * JUST_INTERPOSE: just call the real functions
  * JUST_BOOKKEEPING: just update data structures then call the real functions
@@ -77,11 +78,7 @@
 /* functions */
 
 static void *mrs_malloc(size_t);
-#ifndef OFFLOAD_QUARANTINE
 static void mrs_free(void *);
-#else /* !OFFLOAD_QUARANTINE */
-static void mrs_free_offload(void *);
-#endif /* OFFLOAD_QUARANTINE */
 static void *mrs_calloc(size_t, size_t);
 static void *mrs_realloc(void *, size_t);
 static int mrs_posix_memalign(void **, size_t, size_t);
@@ -91,11 +88,7 @@ void *malloc(size_t size) {
 	return mrs_malloc(size);
 }
 void free(void *ptr) {
-#ifndef OFFLOAD_QUARANTINE
 	return mrs_free(ptr);
-#else /* !OFFLOAD_QUARANTINE */
-	return mrs_free_offload(ptr);
-#endif
 }
 void *calloc(size_t number, size_t size) {
 	return mrs_calloc(number, size);
@@ -110,6 +103,7 @@ void *aligned_alloc(size_t alignment, size_t size) {
 	return mrs_aligned_alloc(alignment, size);
 }
 
+/* should be defined by CHERIfied mallocs */
 size_t malloc_allocation_size(void *) __attribute__((weak));
 
 /* globals */
@@ -534,6 +528,65 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 	quarantine->size = 0;
 }
 
+/*
+ * check whether we should flush based on the quarantine policy and perform the
+ * flush if so.  takes into account whether offload is enabled or not.
+ *
+ * in the wrapper, we perform these checks at the beginning of allocation
+ * routines (so that the allocation routines might use the revoked memory in
+ * the non-offload edge case where this could happen) rather than during an
+ * mmap call - it might be better to perform this check just as the allocator
+ * runs out of memory and before it calls mmap, but this is not possible from
+ * the wrapper.
+ */
+static inline void check_and_perform_flush() {
+#ifdef OFFLOAD_QUARANTINE
+
+/*
+ * we trigger a revocation pass when the unvalidated quarantine hits the
+ * highwater mark because if we waited until the validated queue passed the
+ * highwater mark, the allocated size might increase (allocations made) between
+ * the unvalidated queue and validated queue filling such that the high water
+ * mark is no longer hit. this function just fills up the unvalidated
+ * quarantine and passes it off when it's full. with offload enabled,
+ * the "quarantine" global is unvalidated and passed off to the
+ * "offload_quarantine" global then processed in place (list entries that fail
+ * validation are not processed).
+ */
+if (quarantine_should_flush(&application_quarantine)) {
+		mrs_printf("check_and_perform_flush (offload): passed application_quarantine threshold, offloading: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
+		mrs_lock(&offload_quarantine_lock);
+		while (offload_quarantine.list != NULL) {
+			mrs_debug_printf("check_and_perform_flush (offload): waiting for offload_quarantine to drain\n");
+			if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
+				mrs_printf("pthread error\n");
+				exit(7);
+			}
+		}
+		mrs_debug_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
+
+		offload_quarantine.list = application_quarantine.list;
+		offload_quarantine.size = application_quarantine.size;
+		application_quarantine.list = NULL;
+		application_quarantine.size = 0;
+
+		mrs_unlock(&offload_quarantine_lock);
+		if (pthread_cond_signal(&offload_quarantine_ready)) {
+			mrs_printf("pthread error\n");
+			exit(7);
+		}
+	}
+
+#else /* OFFLOAD_QUARANTINE */
+
+	if (quarantine_should_flush(&application_quarantine)) {
+		mrs_printf("check_and_perform_flush (no offload): passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
+		quarantine_flush(&application_quarantine);
+	}
+
+#endif /* !OFFLOAD_QUARANTINE */
+}
+
 /* constructor and destructor */
 
 __attribute__((constructor))
@@ -593,11 +646,15 @@ static void *mrs_malloc(size_t size) {
 	return real_malloc(size);
 #endif /* JUST_INTERPOSE */
 
-	/*mrs_debug_printf("mrs_malloc: called\n");*/
+	mrs_debug_printf("mrs_malloc: called\n");
 
 	if (size == 0) {
 		return NULL;
 	}
+
+#ifndef REVOKE_ON_FREE
+	check_and_perform_flush();
+#endif /* !REVOKE_ON_FREE */
 
 	void *allocated_region;
 
@@ -684,6 +741,10 @@ void *mrs_calloc(size_t number, size_t size) {
 		return NULL;
 	}
 
+#ifndef REVOKE_ON_FREE
+	check_and_perform_flush();
+#endif /* !REVOKE_ON_FREE */
+
 	void *allocated_region;
 
 	/*
@@ -727,6 +788,10 @@ static int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
 
 	mrs_debug_printf("mrs_posix_memalign: called ptr %p alignment %zu size %zu\n", ptr, alignment, size);
 
+#ifndef REVOKE_ON_FREE
+	check_and_perform_flush();
+#endif /* !REVOKE_ON_FREE */
+
 	if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
 		alignment = CAPREVOKE_BITMAP_ALIGNMENT;
 	}
@@ -748,6 +813,10 @@ static void *mrs_aligned_alloc(size_t alignment, size_t size) {
 
 	mrs_debug_printf("mrs_aligned_alloc: called alignment %zu size %zu\n", alignment, size);
 
+#ifndef REVOKE_ON_FREE
+	check_and_perform_flush();
+#endif /* !REVOKE_ON_FREE */
+
 	if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
 		alignment = CAPREVOKE_BITMAP_ALIGNMENT;
 	}
@@ -768,7 +837,6 @@ static void *mrs_aligned_alloc(size_t alignment, size_t size) {
  * its buffer will still get copied into a new allocation.
  */
 static void *mrs_realloc(void *ptr, size_t size) {
-
 #ifdef JUST_INTERPOSE
 	return real_realloc(ptr, size);
 #endif /* JUST_INTERPOSE */
@@ -777,7 +845,7 @@ static void *mrs_realloc(void *ptr, size_t size) {
 	mrs_debug_printf("mrs_realloc: called ptr %p ptr size %zu new size %zu\n", ptr, old_size, size);
 
 	if (size == 0) {
-		free(ptr);
+		mrs_free(ptr);
 		return NULL;
 	}
 
@@ -791,11 +859,9 @@ static void *mrs_realloc(void *ptr, size_t size) {
 		return NULL;
 	}
 	memcpy(new_alloc, ptr, size < old_size ? size : old_size);
-	free(ptr);
+	mrs_free(ptr);
 	return new_alloc;
 }
-
-#ifndef OFFLOAD_QUARANTINE
 
 static void mrs_free(void *ptr) {
 #ifdef JUST_INTERPOSE
@@ -804,13 +870,18 @@ static void mrs_free(void *ptr) {
 
 	mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
+#ifndef OFFLOAD_QUARANTINE
 	size_t alloc_size = validate_freed_pointer(ptr);
 	if (alloc_size == 0) {
 		mrs_debug_printf("mrs_free: validation failed\n");
 		return;
 	}
+#else /* !OFFLOAD_QUARANTINE */
+	/* in the offload case, use alloc_size of 0 to indicate an unvalidated descriptor */
+	size_t alloc_size = 0;
+#endif /* OFFLOAD_QUARANTINE */
 
-	// TODO refactor and also include in the offload case
+	// TODO revisit coalescing/bypass
 #ifdef BYPASS_QUARANTINE
 	/*
 	 * if this is a full-page(s) allocation, bypass the quarantine by
@@ -834,56 +905,12 @@ static void mrs_free(void *ptr) {
 
 	quarantine_insert(&application_quarantine, ptr, alloc_size);
 
-	if (quarantine_should_flush(&application_quarantine)) {
-		mrs_printf("mrs_free: passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
-		quarantine_flush(&application_quarantine);
-	}
+#ifdef REVOKE_ON_FREE
+	check_and_perform_flush();
+#endif /* REVOKE_ON_FREE */
 }
 
-#else /* !OFFLOAD_QUARANTINE */
-
-/*
- * we trigger a revocation pass when the unvalidated quarantine hits the
- * highwater mark because if we waited until the validated queue passed the
- * highwater mark, the allocated size might increase (allocations made) between
- * the unvalidated queue and validated queue filling such that the high water
- * mark is no longer hit. this function just fills up the unvalidated
- * quarantine and passes it off when it's full. with offload enabled,
- * the "quarantine" global is unvalidated and passed off to the
- * "offload_quarantine" global then processed in place (list entries that fail
- * validation are not processed).
- */
-static void mrs_free_offload(void *ptr) {
-	mrs_debug_printf("mrs_free_offload: called address %p\n", ptr);
-
-	/* use alloc_size of 0 to indicate unvalidated descriptor */
-quarantine_insert(&application_quarantine, ptr, 0);
-
-if (quarantine_should_flush(&application_quarantine)) {
-		mrs_printf("mrs_free_offload: passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
-		mrs_lock(&offload_quarantine_lock);
-		while (offload_quarantine.list != NULL) {
-			mrs_debug_printf("mrs_free_offload: waiting for offload_quarantine to drain\n");
-			if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
-				mrs_printf("pthread error\n");
-				exit(7);
-			}
-		}
-		mrs_debug_printf("mrs_free_offload: offload_quarantine drained\n");
-
-		offload_quarantine.list = application_quarantine.list;
-		offload_quarantine.size = application_quarantine.size;
-		application_quarantine.list = NULL;
-		application_quarantine.size = 0;
-
-		mrs_unlock(&offload_quarantine_lock);
-		if (pthread_cond_signal(&offload_quarantine_ready)) {
-			mrs_printf("pthread error\n");
-			exit(7);
-		}
-	}
-}
-
+#ifdef OFFLOAD_QUARANTINE
 static void *mrs_offload_thread(void *arg) {
 	mrs_lock(&offload_quarantine_lock);
 	for (;;) {
@@ -917,5 +944,4 @@ static void *mrs_offload_thread(void *arg) {
 		}
 	}
 }
-
 #endif /* OFFLOAD_QUARANTINE */
