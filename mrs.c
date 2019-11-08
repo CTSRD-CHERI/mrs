@@ -626,6 +626,8 @@ static void init(void) {
 		mrs_printf("error getting entire shadow cap\n");
 		exit(7);
 	}
+
+	mrs_printf(VERSION_STRING);
 }
 
 #ifdef PRINT_STATS
