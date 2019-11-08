@@ -59,7 +59,8 @@
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * PRINT_CAPREVOKE: print stats for each caprevoke
- * CLEAR_ALLOCATIONS: make sure that allocated regions are zeroed (contain no tags or data) before giving them out
+ * CLEAR_ON_ALLOC: zero allocated regions as they are allocated (for non-calloc allocation functions)
+ * CLEAR_ON_FREE: zero allocated regions as they come out of quarantine
  * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
  * REVOKE_ON_FREE: perform revocation on free rather than during allocation routines
  *
@@ -263,6 +264,21 @@ static inline void increment_allocated_size(void *allocated) {
 	allocated_size += cheri_getlen(allocated);
 	if (allocated_size > max_allocated_size) {
 		max_allocated_size = allocated_size;
+	}
+}
+
+static inline void clear_region(void *mem, size_t len) {
+	static const size_t ZERO_THRESHOLD = 64;
+
+	/* for small regions that are qword-multiple-sized, use writes to avoid
+	 * memset call. alignment should be good in normal cases */
+	if ((len <= ZERO_THRESHOLD) && (len % sizeof(uint64_t) == 0)) {
+		for (size_t i = 0; i < (len / sizeof(uint64_t)); i++) {
+			/* volatile needed to avoid memset call compiler "optimization" */
+			((volatile uint64_t *)mem)[i] = 0;
+		}
+	} else {
+		memset(mem, 0, len);
 	}
 }
 
@@ -685,24 +701,9 @@ static void *mrs_malloc(size_t size) {
 		}
 	}
 
-	/*
-	 * clearing allocations could be done after revocation on free (and thus be
-	 * offloaded), but others report that zeroing the memory and bringing it into
-	 * the cache just before allocation results in a performance improvement on
-	 * some platforms, even if not on ours. TODO ask David about heuristics for
-	 * this
-	 *
-	 * for revocation, clearing in the free function (but after revocation) may
-	 * slightly reduce the cost of sweeping in later passes by reducing the
-	 * number of capabilities in memory.
-	 *
-	 * we may also get a performance improvement by checking whether the
-	 * allocations are 16-byte, 32-byte, multiples of 8-byte, etc. and replacing
-	 * the memset with inline stores.
-	 */
-#ifdef CLEAR_ALLOCATIONS
-	memset(allocated_region, 0, cheri_getlen(allocated_region));
-#endif /* CLEAR_ALLOCATIONS */
+#ifdef CLEAR_ON_ALLOC
+	clear_region(allocated_region, cheri_getlen(allocated_region));
+#endif /* CLEAR_ON_ALLOC */
 
 	increment_allocated_size(allocated_region);
 
@@ -803,6 +804,10 @@ static int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
 		return ret;
 	}
 
+#ifdef CLEAR_ON_ALLOC
+	clear_region(*ptr, cheri_getlen(*ptr));
+#endif /* CLEAR_ON_ALLOC */
+
 	increment_allocated_size(*ptr);
 
 	return ret;
@@ -827,6 +832,10 @@ static void *mrs_aligned_alloc(size_t alignment, size_t size) {
 	if (allocated_region == NULL) {
 	 return allocated_region;
 	}
+
+#ifdef CLEAR_ON_ALLOC
+	clear_region(allocated_region, cheri_getlen(allocated_region));
+#endif /* CLEAR_ON_ALLOC */
 
 	increment_allocated_size(allocated_region);
 
