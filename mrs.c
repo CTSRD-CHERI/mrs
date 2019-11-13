@@ -104,8 +104,13 @@ void *aligned_alloc(size_t alignment, size_t size) {
 	return mrs_aligned_alloc(alignment, size);
 }
 
-/* should be defined by CHERIfied mallocs */
-size_t malloc_allocation_size(void *) __attribute__((weak));
+/*
+ * should be defined by CHERIfied mallocs - given a capability returned by the
+ * malloc that may have had its bounds shrunk, rederive and return a capability
+ * with bounds corresponding to the original allocation (and VMMAP permission)
+ * or NULL if the given capability was not allocated by the malloc.
+ */
+void *malloc_underlying_allocation(void *) __attribute__((weak));
 
 /* globals */
 
@@ -118,15 +123,10 @@ volatile const struct caprevoke_info *cri;
 static size_t page_size;
 static void *entire_shadow;
 
-struct mrs_allocation_info {
-	void *freed_ptr;
-	size_t underlying_size;
-};
-
 struct mrs_descriptor_slab {
 	int num_descriptors;
 	struct mrs_descriptor_slab *next;
-	struct mrs_allocation_info slab[DESCRIPTOR_SLAB_ENTRIES];
+	void *slab[DESCRIPTOR_SLAB_ENTRIES];
 };
 
 struct mrs_quarantine {
@@ -234,31 +234,27 @@ static struct mrs_descriptor_slab *alloc_descriptor_slab() {
 }
 
 /*
- * TODO knob for underlying allocation
  * we assume that the consumer of this shim can issue arbitrary malicious
- * malloc/free calls. by using the length of the capability returned from
- * malloc to increment allocated size and the capability given back by the user
- * to increment the quarantine size (only if that capability's base is actually
- * the base of an allocation, as confirmed by usable_malloc_size), we guarantee
- * that for each freed allocation, allocated_size will have been incremented by
- * at least as much as quarantine_size gets incremented. this is important
- * because quarantine_size gets subtracted from allocated_size. if the above
- * guarantee did not hold, an attacker could make allocated_size go negative
- * and prevent sweeps from taking place (this still does not allow heap aliasing).
+ * malloc/free calls. to track the total allocated size effectively, we
+ * accumulate the length of capabilities as they are returned by mrs_malloc.
+ * for the quarantine size, tracking is different in the offload and
+ * non-offload cases. in the non-offload case, capabilities passed in to
+ * mrs_free are validated and replaced with a rederived capability to the
+ * entire allocation (obtained by calling the underlying allocator's
+ * malloc_underlying_allocation() function) before being added to quarantine,
+ * so we accumulate the length of capabilities in quarantine post-validation.
+ * the result is that for each allocation, the same number is added to the
+ * allocated size total and the quarantine size total. when the quarantine is
+ * flushed, the allocated size is reduced by the quarantine size and the
+ * quarantine size is reset to zero.
  *
- * we could alternatively call malloc_usable_size during allocation and free to
- * make sure the same number is being added to allocated_size and
- * quarantine_size, but this adds a slight additional cost to allocation.
- * perhaps worth it.
- *
- * in the current code it is still possible for an attacker to inflate
- * quarantine_size by repeatedly freeing the same legitimately allocated
- * pointer. one solution to this is to paint the bitmap as each allocation is
- * freed, and only report the painting as a success if the region of the bitmap
- * is not already painted. this might slightly increase the cost of painting
- * and lessen the benefit of the offload thread. another possible solution is
- * to detect when allocated_size goes negative and take some appropriate
- * action, but more thought is needed there.
+ * in the offload case, the application thread fills a quarantine with
+ * unvalidated capabilities passed in to mrs_free() (which may be untagged,
+ * duplicates, have shrunk bounds, etc.). the lengths of these capabilities are
+ * accumulated into the quarantine size, which is an approximation and only
+ * used to trigger offload processing. in the offload thread, a separate
+ * accumulation is performed using only validated capabilities, and that is used
+ * to reduce the allocated size after flushing.
  */
 static inline void increment_allocated_size(void *allocated) {
 	allocated_size += cheri_getlen(allocated);
@@ -282,8 +278,11 @@ static inline void clear_region(void *mem, size_t len) {
 	}
 }
 
-/* just insert a freed allocation into a quarantine, no validation, increase quarantine size by length of allocation capability */
-static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr, size_t alloc_size) {
+/*
+ * just insert a freed allocation into a quarantine, no validation, increase
+ * quarantine size by the length of the allocation's capability
+ */
+static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr) {
 
 	if (quarantine->list == NULL || quarantine->list->num_descriptors == DESCRIPTOR_SLAB_ENTRIES) {
 		struct mrs_descriptor_slab *ins = alloc_descriptor_slab();
@@ -295,12 +294,11 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
 		quarantine->list = ins;
 	}
 
-	quarantine->list->slab[quarantine->list->num_descriptors].freed_ptr = ptr;
-	quarantine->list->slab[quarantine->list->num_descriptors].underlying_size = alloc_size;
+	quarantine->list->slab[quarantine->list->num_descriptors] = ptr;
 
 	quarantine->list->num_descriptors++;
 
-	quarantine->size += cheri_getlen(ptr); // TODO knob for incrementing quarantine size by underlying allocation (need to do this on the allocation side too)
+	quarantine->size += cheri_getlen(ptr);
 	if (quarantine->size > quarantine->max_size) {
 		quarantine->max_size = quarantine->size;
 	}
@@ -312,32 +310,32 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
  * allocator) and (2) using the bitmap painting function to make sure this
  * pointer is valid and hasn't already been freed or revoked.
  *
- * returns the size of the underlying allocation if validation was successful,
- * 0 otherwise.
+ * returns a capability to the underlying allocation if validation was successful,
+ * NULL otherwise.
  *
- * supports ablation study knobs, returning 0 in case of a short circuit.
+ * supports ablation study knobs, returning NULL in case of a short circuit.
  *
  */
-static inline size_t validate_freed_pointer(void *ptr) {
+static inline void *validate_freed_pointer(void *ptr) {
 
 	/*
-	 * untagged check before malloc_allocation_size() catches NULL and other invalid
-	 * caps that may cause a rude implementation of malloc_allocation_size() to crash.
+	 * untagged check before malloc_underlying_allocation() catches NULL and other invalid
+	 * caps that may cause a rude implementation of malloc_underlying_allocation() to crash.
 	 */
 	if (!cheri_gettag(ptr)) {
 		mrs_debug_printf("validate_freed_pointer: untagged capability\n");
-		return 0;
+		return NULL;
 	}
 
-	size_t alloc_size = malloc_allocation_size(ptr);
-	if (alloc_size == 0) {
+	void *underlying_allocation = malloc_underlying_allocation(ptr);
+	if (underlying_allocation == NULL) {
 		mrs_debug_printf("validate_freed_pointer: not allocated by underlying allocator\n");
-		return 0;
+		return NULL;
 	}
 
 #ifdef JUST_BOOKKEEPING
 	real_free(ptr);
-	return 0;
+	return NULL;
 #endif /* JUST_BOOKKEEPING */
 
 	/*
@@ -387,14 +385,18 @@ static inline size_t validate_freed_pointer(void *ptr) {
 	 */
 
 #if !defined(JUST_QUARANTINE)
-	/* doesn't matter whether alloc_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-	if (caprev_shadow_nomap_set_len(entire_shadow, cheri_getbase(ptr), __builtin_align_up(alloc_size, CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
+	/*
+	 * doesn't matter whether or not the len of underlying_allocation is
+	 * actually a 16-byte multiple because all allocations will be 16-byte
+	 * aligned
+	 */
+	if (caprev_shadow_nomap_set_len(entire_shadow, cheri_getbase(ptr), __builtin_align_up(cheri_getlen(underlying_allocation), CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
 		mrs_debug_printf("validate_freed_pointer: setting bitmap failed\n");
-		return 0;
+		return NULL;
 	}
 #endif /* !JUST_QUARANTINE */
 
-	return alloc_size;
+	return underlying_allocation;
 }
 
 static inline bool quarantine_should_flush(struct mrs_quarantine *quarantine) {
@@ -511,18 +513,18 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 	struct mrs_descriptor_slab *prev = NULL;
 	for (struct mrs_descriptor_slab *iter = quarantine->list; iter != NULL; iter = iter->next) {
 		for (int i = 0; i < iter->num_descriptors; i++) {
-			/* in the offload case, only clear the bitmap for validated descriptors (underlying_size != 0) */
+			/* in the offload case, only clear the bitmap for validated descriptors (cap != NULL) */
 #ifdef OFFLOAD_QUARANTINE
-			if (iter->slab[i].underlying_size != 0) {
+			if (iter->slab[i] != NULL) {
 #endif /* OFFLOAD_QUARANTINE */
 
 #if !defined(JUST_QUARANTINE)
 				/* doesn't matter if underlying_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-				caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->slab[i].freed_ptr), __builtin_align_up(iter->slab[i].underlying_size, CAPREVOKE_BITMAP_ALIGNMENT));
+				caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->slab[i]), __builtin_align_up(cheri_getlen(iter->slab[i]), CAPREVOKE_BITMAP_ALIGNMENT));
 				atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
-				/* this will be a revoked capability, which the allocator must accept */
-				real_free(iter->slab[i].freed_ptr);
+
+				real_free(iter->slab[i]);
 
 #ifdef OFFLOAD_QUARANTINE
 			}
@@ -557,6 +559,9 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
  */
 static inline void check_and_perform_flush() {
 #ifdef OFFLOAD_QUARANTINE
+
+	// TODO perhaps allow the application to continue when we are past the high
+	// water mark instead of blocking for the offload thread to finish flushing
 
 /*
  * we trigger a revocation pass when the unvalidated quarantine hits the
@@ -881,16 +886,19 @@ static void mrs_free(void *ptr) {
 
 	mrs_debug_printf("mrs_free: called address %p\n", ptr);
 
+	void *ins = ptr;
+
+	/*
+	 * if not offloading, validate the passed-in cap here and replace it with the
+	 * cap to its underlying allocation
+	 */
 #ifndef OFFLOAD_QUARANTINE
-	size_t alloc_size = validate_freed_pointer(ptr);
-	if (alloc_size == 0) {
+	ins = validate_freed_pointer(ptr);
+	if (ins == NULL) {
 		mrs_debug_printf("mrs_free: validation failed\n");
 		return;
 	}
-#else /* !OFFLOAD_QUARANTINE */
-	/* in the offload case, use alloc_size of 0 to indicate an unvalidated descriptor */
-	size_t alloc_size = 0;
-#endif /* OFFLOAD_QUARANTINE */
+#endif /* !OFFLOAD_QUARANTINE */
 
 	// TODO revisit coalescing/bypass
 #ifdef BYPASS_QUARANTINE
@@ -914,7 +922,7 @@ static void mrs_free(void *ptr) {
 	}
 #endif /* BYPASS_QUARANTINE */
 
-	quarantine_insert(&application_quarantine, ptr, alloc_size);
+	quarantine_insert(&application_quarantine, ins);
 
 #ifdef REVOKE_ON_FREE
 	check_and_perform_flush();
@@ -934,15 +942,15 @@ static void *mrs_offload_thread(void *arg) {
 		}
 		mrs_debug_printf("mrs_offload_thread: offload_quarantine ready\n");
 
-		/* iterate through the quarantine validating the freed pointers. alloc_size of 0 means invalid. */
+		/* re-calculate the quarantine's size using only valid descriptors. */
+		offload_quarantine.size = 0;
+		/* iterate through the quarantine validating the freed pointers. */
 		for (struct mrs_descriptor_slab *iter = offload_quarantine.list; iter != NULL; iter = iter->next) {
 			for (int i = 0; i < iter->num_descriptors; i++) {
-				iter->slab[i].underlying_size = validate_freed_pointer(iter->slab[i].freed_ptr);
+				iter->slab[i] = validate_freed_pointer(iter->slab[i]);
 
-				/* if the pointer was invalid, don't include it in the size calculation */
-				if (iter->slab[i].underlying_size == 0) {
-					// TODO can use underlying alloc size if knob is set
-					offload_quarantine.size -= cheri_getlen(iter->slab[i].freed_ptr);
+				if (iter->slab[i] != NULL) {
+					offload_quarantine.size += cheri_getlen(iter->slab[i]);
 				}
 			}
 		}
