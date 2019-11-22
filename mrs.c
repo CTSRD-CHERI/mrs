@@ -107,8 +107,10 @@ void *aligned_alloc(size_t alignment, size_t size) {
 /*
  * should be defined by CHERIfied mallocs - given a capability returned by the
  * malloc that may have had its bounds shrunk, rederive and return a capability
- * with bounds corresponding to the original allocation (and VMMAP permission)
- * or NULL if the given capability was not allocated by the malloc.
+ * with bounds corresponding to the original allocation. return NULL or crash
+ * if the given capability was not allocated by the malloc. the returned
+ * pointer should not have the VMMAP permission, because this function is also
+ * exposed to the application.
  */
 void *malloc_underlying_allocation(void *) __attribute__((weak));
 
@@ -524,6 +526,11 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 				atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
 
+#ifdef CLEAR_ON_FREE
+				clear_region(iter->slab[i], cheri_getlen(iter->slab[i]));
+#endif /* CLEAR_ON_FREE */
+
+				/* allocator must accept revoked cap */
 				real_free(iter->slab[i]);
 
 #ifdef OFFLOAD_QUARANTINE
