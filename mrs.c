@@ -61,7 +61,6 @@
  * PRINT_CAPREVOKE: print stats for each caprevoke
  * CLEAR_ON_ALLOC: zero allocated regions as they are allocated (for non-calloc allocation functions)
  * CLEAR_ON_FREE: zero allocated regions as they come out of quarantine
- * CONCURRENT_REVOCATION_PASS: enable a concurrent revocation pass before the stop-the-world pass
  * REVOKE_ON_FREE: perform revocation on free rather than during allocation routines
  *
  * JUST_INTERPOSE: just call the real functions
@@ -73,6 +72,7 @@
  *
  * QUARANTINE_HIGHWATER: limit the quarantine size to QUARANTINE_HIGHWATER number of bytes
  * QUARANTINE_RATIO: limit the quarantine size to 1 / QUARANTINE_RATIO times the size of the heap (default 4)
+ * CONCURRENT_REVOCATION_PASSES: number of concurrent revocation pass before the stop-the-world pass
  *
  */
 
@@ -479,30 +479,37 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 # ifdef PRINT_CAPREVOKE
 		uint64_t cyc_init, cyc_fini;
 
-#  ifdef CONCURRENT_REVOCATION_PASS
-		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
-		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("initial", &crst, cyc_fini - cyc_init);
+#  if CONCURRENT_REVOCATION_PASSES > 0
+		/* Run all concurrent passes as their own syscalls so we can report accurately */
+		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES; i++) {
+			cyc_init = caprevoke_get_cyc();
+			caprevoke(CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
+			cyc_fini = caprevoke_get_cyc();
+			print_caprevoke_stats("concurrent", &crst, cyc_fini - cyc_init);
+		}
 		cyc_init = caprevoke_get_cyc();
 		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
 		cyc_fini = caprevoke_get_cyc();
 		print_caprevoke_stats("final", &crst, cyc_fini - cyc_init);
-#  else /* CONCURRENT_REVOCATION_PASS */
+#  else /* CONCURRENT_REVOCATION_PASSES */
 		cyc_init = caprevoke_get_cyc();
 		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
 		cyc_fini = caprevoke_get_cyc();
 		print_caprevoke_stats("single", &crst, cyc_fini - cyc_init);
-#  endif /* !CONCURRENT_REVOCATION_PASS */
+#  endif /* !CONCURRENT_REVOCATION_PASSES */
 
 # else /* PRINT_CAPREVOKE */
 
-#  ifdef CONCURRENT_REVOCATION_PASS
-		const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC);
-#  else /* CONCURRENT_REVOCATION_PASS */
-		const int MRS_CAPREVOKE_FLAGS = (CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY);
-#  endif /* !CONCURRENT_REVOCATION_PASS */
-		caprevoke(MRS_CAPREVOKE_FLAGS, start_epoch, &crst);
+#  if CONCURRENT_REVOCATION_PASSES > 0
+		/* Bundle the last concurrent pass with the last pass */
+		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES - 1; i++) {
+			caprevoke(CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
+		}
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
+#  else
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
+#  endif
+
 # endif /* !PRINT_CAPREVOKE */
 
 	}
