@@ -431,31 +431,47 @@ print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
 {
 	mrs_printf("mrs caprevoke %s:"
 		" efin=%" PRIu64
-		" psrt=%" PRIu64
-		" psro=%" PRIu64
-		" psrw=%" PRIu64
-		" pfro=%" PRIu64
-		" pfrw=%" PRIu64
-		" pskf=%" PRIu64
-		" psks=%" PRIu64
-		" cfnd=%" PRIu64
-		" cfrv=%" PRIu64
-		" cnuk=%" PRIu64
+
+		" psrt=%" PRIu32
+		" psro=%" PRIu32
+		" psrw=%" PRIu32
+
+		" pfro=%" PRIu32
+		" pfrw=%" PRIu32
+
+		" pskf=%" PRIu32
+		" psks=%" PRIu32
+
+		" cfnd=%" PRIu32
+		" cfrv=%" PRIu32
+
+		" cnuk=%" PRIu32
+
+		" lscn=%" PRIu32
+
 		" pcyc=%" PRIu64
 		" tcyc=%" PRIu64
 		"\n",
 		what,
 		crst->epoch_fini,
+
 		crst->pages_retried,
 		crst->pages_scan_ro,
 		crst->pages_scan_rw,
+
 		crst->pages_faulted_ro,
 		crst->pages_faulted_rw,
+
 		crst->pages_skip_fast,
 		crst->pages_skip,
+
 		crst->caps_found,
 		crst->caps_found_revoked,
+
 		crst->caps_cleared,
+
+		crst->lines_scan,
+
 		crst->page_scan_cycles,
 		cycles
 	);
