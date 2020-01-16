@@ -105,12 +105,52 @@ void *aligned_alloc(size_t alignment, size_t size) {
 }
 
 /*
- * should be defined by CHERIfied mallocs - given a capability returned by the
- * malloc that may have had its bounds shrunk, rederive and return a capability
- * with bounds corresponding to the original allocation. return NULL or crash
- * if the given capability was not allocated by the malloc. the returned
- * pointer should not have the VMMAP permission, because this function is also
- * exposed to the application.
+ * defined by CHERIfied mallocs for use with mrs - given a capability returned
+ * by the malloc that may have had its bounds shrunk, rederive and return a
+ * capability with bounds corresponding to the original allocation.
+ *
+ * if the passed-in capability is tagged/permissioned and corresponds to some
+ * allocation, give back a pointer with that same base whose length corresponds
+ * to the underlying allocation size. otherwise return NULL.
+ *
+ * (for corespondence, check that its base matches the base of an allocation.
+ * in practice, check that the offset is zero, which is necessary for the base
+ * to match the base of any allocation, and then it is fine to compare the
+ * address of the passed-in thing (which is the base) to whatever is necessary.
+ * note that the length of the passed-in capability doesn't matter as long as
+ * the allocator uses the underlying size for rederivation or revocation.
+ *
+ * this function will give back a pointer with VMMAP permissions, so mrs can
+ * clear its memory and free it back post revocation. with mrs we assume the
+ * attacker can't access this function, and in the post-mrs world it is
+ * unnecessary.
+ *
+ * NB that as long as an allocator's allocations are naturally aligned
+ * according to their size, as is the case for most slab/bibop allocators, it
+ * is possible to check this condition by verifying that the passed-in
+ * base/address is contained in the heap and is aligned to the size of
+ * allocations in that heap region (power of 2 size or otherwise). it may be
+ * necessary to do something verly slightly more complicated, like checking
+ * offset from the end of a slab in snmalloc. in traditional free list
+ * allocators, allocation metadata can be used to verify that the passed-in
+ * pointer is legit.
+ *
+ * (writeup needs more detail about exactly what alloctors
+ * will give back and expect in terms of base offset etc.)
+ *
+ * in an allocator that is not using mrs, similar logic should be used to
+ * validate and/or rederive pointers and take actions accordingly on the free
+ * path and any other function that accepts application pointers. a pointer
+ * passed to free must correspond appropriately as described above. if it
+ * doesn't then no action can be taken or you can abort.
+ *
+ * malloc_usable_size() and any other function taking in pointers similarly
+ * needs validation.
+ *
+ * NB it is possible to do revocation safely with mrs only using a version of
+ * malloc_usable_size() modified to give the size of the underlying allocation -
+ * but this was done so that clearing on free could be evaluated easily and
+ * so that allocators wouldn't have to accept revoked caps.
  */
 void *malloc_underlying_allocation(void *) __attribute__((weak));
 
@@ -257,6 +297,9 @@ static struct mrs_descriptor_slab *alloc_descriptor_slab() {
  * used to trigger offload processing. in the offload thread, a separate
  * accumulation is performed using only validated capabilities, and that is used
  * to reduce the allocated size after flushing.
+ *
+ * sometimes malloc implementations are recursive in which case we leak some
+ * space. this was observed in snmalloc for allocations of size 0x20.
  */
 static inline void increment_allocated_size(void *allocated) {
 	allocated_size += cheri_getlen(allocated);
@@ -324,10 +367,10 @@ static inline void *validate_freed_pointer(void *ptr) {
 	 * untagged check before malloc_underlying_allocation() catches NULL and other invalid
 	 * caps that may cause a rude implementation of malloc_underlying_allocation() to crash.
 	 */
-	if (!cheri_gettag(ptr)) {
-		mrs_debug_printf("validate_freed_pointer: untagged capability\n");
-		return NULL;
-	}
+	/*if (!cheri_gettag(ptr)) {*/
+		/*mrs_debug_printf("validate_freed_pointer: untagged capability\n");*/
+		/*return NULL;*/
+	/*}*/
 
 	void *underlying_allocation = malloc_underlying_allocation(ptr);
 	if (underlying_allocation == NULL) {
@@ -530,7 +573,7 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 				clear_region(iter->slab[i], cheri_getlen(iter->slab[i]));
 #endif /* CLEAR_ON_FREE */
 
-				/* allocator must accept revoked cap */
+				/* we have a VMMAP-bearing cap from malloc_underlying_allocation */
 				real_free(iter->slab[i]);
 
 #ifdef OFFLOAD_QUARANTINE
@@ -719,7 +762,8 @@ static void *mrs_malloc(size_t size) {
 
 	increment_allocated_size(allocated_region);
 
-	mrs_debug_printf("mrs_malloc: called size 0x%zx address %p\n", size, allocated_region);
+	mrs_debug_printf("mrs_malloc: called size 0x%zx\n", size);
+	mrs_debug_printcap("allocation", allocated_region);
 
 	return allocated_region;
 }
