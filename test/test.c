@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <malloc_np.h>
 
 void assert_not_revoked(void *cap) {
 	assert(!caprevoke_is_revoked(cap));
@@ -127,23 +128,110 @@ void reuse_test() {
 	}
 }
 
-size_t __attribute__((weak)) malloc_allocation_size(void *);
+void malloc_usable_size_test() {
+	char *myptr = (char *)malloc(16);
+	size_t usable_size = malloc_usable_size(myptr);
+	assert(usable_size >= 16);
+	myptr += 1;
+	usable_size = malloc_usable_size(myptr);
+	assert(usable_size == 0);
+}
 
-void malloc_allocation_size_test() {
-	int x = 0;
-	void * volatile ptr = malloc(7);
-	assert(malloc_allocation_size(ptr) != 0);
-	assert(malloc_allocation_size((void *)&x) == 0); /* or crash, but that is rude */
+__attribute__((weak))
+void *malloc_underlying_allocation(void *);
+
+void malloc_underlying_allocation_test() {
+	char *orig = (char *)malloc(16);
+	printf("original %#p\n", orig);
+
+	char *underlying = malloc_underlying_allocation(orig);
+	printf("0 underlying %#p original %#p\n", underlying, orig);
+
+	char *restricted = cheri_csetbounds(orig, 4);
+	underlying = malloc_underlying_allocation(restricted);
+	printf("1 underlying %#p restricted %#p\n", underlying, restricted);
+
+	restricted += 1;
+	underlying = malloc_underlying_allocation(restricted);
+	printf("2 underlying %#p restricted %#p\n", underlying, restricted);
+
+	restricted = cheri_csetbounds(orig + 4, 4);
+	underlying = malloc_underlying_allocation(restricted);
+	printf("3 underlying %#p original %#p\n", underlying, orig);
 }
 
 /* with quarantine highwater 1 tests revoked free, with >16 tests double free. both test untagged free. */
-void invalid_free_test() {
+void revoked_double_free_test() {
 	void * volatile ptr = malloc(16);
 	free(ptr);
 	free(ptr);
 	ptr = (void *)0x7;
 	free(ptr);
 }
+
+/*
+ * test how underlying mallocs respond to malformed inputs to free -
+ * if the allocator doesn't crash, and next alloc isn't the address
+ * that was just freed, you need to inspect the allocator's internals to
+ * determine whether the free succeeded or not.
+ */
+
+void malformed_free_untagged() {
+	char *myptr = (char *)malloc(32);
+	myptr = cheri_cleartag(myptr);
+	printf("freeing %#p\n", myptr);
+	free(myptr);
+	myptr = (char *)malloc(32);
+	printf("next alloc %#p\n", myptr);
+}
+
+void malformed_free_perms() {
+	char *myptr = (char *)malloc(32);
+	myptr = cheri_andperm(myptr, 0);
+	printf("freeing %#p\n", myptr);
+	free(myptr);
+	myptr = (char *)malloc(32);
+	printf("next alloc %#p\n", myptr);
+}
+
+void malformed_free_addr_badalign() {
+	char *myptr = (char *)malloc(32);
+	myptr += 4;
+	printf("freeing %#p\n", myptr);
+	free(myptr);
+	myptr = (char *)malloc(32);
+	printf("next alloc %#p\n", myptr);
+}
+
+void malformed_free_addr_goodalign() {
+	char *myptr = (char *)malloc(32);
+	myptr += 16;
+	printf("freeing %#p\n", myptr);
+	free(myptr);
+	myptr = (char *)malloc(32);
+	printf("next alloc %#p\n", myptr);
+}
+
+void malformed_free_base_addr_badalign() {
+	char *myptr = (char *)malloc(32);
+	myptr = cheri_csetbounds(myptr + 4, 28);
+	printf("freeing %#p\n", myptr);
+	free(myptr);
+	myptr = (char *)malloc(32);
+	printf("next alloc %#p\n", myptr);
+}
+
+void malformed_free_base_addr_goodalign() {
+	char *myptr = (char *)malloc(32);
+	myptr = cheri_csetbounds(myptr + 16, 16);
+	printf("freeing %#p\n", myptr);
+	free(myptr);
+	myptr = (char *)malloc(32);
+	printf("next alloc %#p\n", myptr);
+}
+
+/* shrunk bounds may cause a crash but are highly unlikely to result in safety
+ * violations so we don't check them */
 
 int main(int argc, char *argv[]) {
 	printf("mrs test start\n");
@@ -156,7 +244,16 @@ int main(int argc, char *argv[]) {
 	/*uaf_high_water_offload();*/
 	/*basic_stress_test(1024 * 16);*/
 	/*reuse_test();*/
-	/*invalid_free_test();*/
-	/*malloc_allocation_size_test();*/
+	/*revoked_double_free_test();*/
+	/*malloc_usable_size_test();*/
+	/*malloc_underlying_allocation_test();*/
+
+	/*malformed_free_untagged();*/
+	/*malformed_free_perms();*/
+	/*malformed_free_addr_badalign();*/
+	/*malformed_free_addr_goodalign();*/
+	/*malformed_free_base_addr_badalign();*/
+	/*malformed_free_base_addr_goodalign();*/
+
 	printf("mrs test end\n");
 }
