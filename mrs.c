@@ -705,9 +705,9 @@ static void init(void) {
 __attribute__((destructor))
 static void fini(void) {
 #ifdef OFFLOAD_QUARANTINE
-	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, offload_quarantine.size, offload_quarantine.max_size);
+	mrs_printf("fini: heap size %zu, max heap size %zu, offload quarantine size %zu, max offload quarantine size %zu\n", allocated_size, max_allocated_size, offload_quarantine.size, offload_quarantine.max_size);
 #else /* OFFLOAD_QUARANTINE */
-	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, quarantine.size, quarantine.max_size);
+	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, application_quarantine.size, application_quarantine.max_size);
 #endif /* !OFFLOAD_QUARANTINE */
 }
 #endif /* PRINT_STATS */
