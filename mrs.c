@@ -510,6 +510,7 @@ print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
 		" cnuk=%" PRIu32
 
 		" lscn=%" PRIu32
+		" pmkc=%" PRIu32
 
 		" pcyc=%" PRIu64
 		" tcyc=%" PRIu64
@@ -533,6 +534,7 @@ print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
 		crst->caps_cleared,
 
 		crst->lines_scan,
+		crst->pages_mark_clean,
 
 		crst->page_scan_cycles,
 		cycles
