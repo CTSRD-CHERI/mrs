@@ -184,6 +184,7 @@ static struct mrs_descriptor_slab *free_descriptor_slabs;
 static struct mrs_descriptor_slab * _Atomic free_descriptor_slabs;
 #endif /* OFFLOAD_QUARANTINE */
 
+/* XXX allocated_size has races in the offload case that are probably harmless */
 static size_t allocated_size; /* amount of memory that the allocator views as allocated (includes quarantine) */
 static size_t max_allocated_size;
 
@@ -347,6 +348,12 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
 	if (quarantine->size > quarantine->max_size) {
 		quarantine->max_size = quarantine->size;
 	}
+#ifdef PRINT_CAPREVOKE
+	if (quarantine->size > allocated_size) {
+		mrs_printf("quarantine size %zu exceeded allocated_size %zu inserting the following cap\n", quarantine->size, allocated_size);
+		mrs_printcap("inserted", ins);
+	}
+#endif /* PRINT_CAPREVOKE */
 }
 
 /*
@@ -377,6 +384,7 @@ static inline void *validate_freed_pointer(void *ptr) {
 		mrs_debug_printf("validate_freed_pointer: not allocated by underlying allocator\n");
 		return NULL;
 	}
+	/*mrs_debug_printcap("freed underlying allocation", underlying_allocation);*/
 
 #ifdef JUST_BOOKKEEPING
 	real_free(ptr);
@@ -617,6 +625,7 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 	quarantine->list = NULL;
 	allocated_size -= quarantine->size;
 	quarantine->size = 0;
+	mrs_debug_printf("quarantine_flush: flushed, allocated_size %zu quarantine->size %zu\n", allocated_size, quarantine->size);
 }
 
 /*
@@ -649,15 +658,21 @@ static inline void check_and_perform_flush() {
  */
 if (quarantine_should_flush(&application_quarantine)) {
 		mrs_printf("check_and_perform_flush (offload): passed application_quarantine threshold, offloading: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
+#ifdef PRINT_CAPREVOKE
+		mrs_printf("check_and_perform flush: cycle count before waiting on offload %" PRIu64 "\n", caprevoke_get_cyc());
+#endif /* PRINT_CAPREVOKE */
 		mrs_lock(&offload_quarantine_lock);
 		while (offload_quarantine.list != NULL) {
-			mrs_debug_printf("check_and_perform_flush (offload): waiting for offload_quarantine to drain\n");
+			mrs_printf("check_and_perform_flush (offload): waiting for offload_quarantine to drain\n");
 			if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
 				mrs_printf("pthread error\n");
 				exit(7);
 			}
 		}
-		mrs_debug_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
+		mrs_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
+#ifdef PRINT_CAPREVOKE
+		mrs_printf("check_and_perform flush: cycle count after waiting on offload %" PRIu64 "\n", caprevoke_get_cyc());
+#endif /* PRINT_CAPREVOKE */
 
 		offload_quarantine.list = application_quarantine.list;
 		offload_quarantine.size = application_quarantine.size;
@@ -742,7 +757,7 @@ static void *mrs_malloc(size_t size) {
 	return real_malloc(size);
 #endif /* JUST_INTERPOSE */
 
-	mrs_debug_printf("mrs_malloc: called\n");
+	/*mrs_debug_printf("mrs_malloc: called\n");*/
 
 	if (size == 0) {
 		return NULL;
@@ -785,8 +800,8 @@ static void *mrs_malloc(size_t size) {
 
 	increment_allocated_size(allocated_region);
 
-	mrs_debug_printf("mrs_malloc: called size 0x%zx\n", size);
-	mrs_debug_printcap("allocation", allocated_region);
+	/*mrs_debug_printf("mrs_malloc: called size 0x%zx\n", size);*/
+	/*mrs_debug_printcap("allocation", allocated_region);*/
 
 	return allocated_region;
 }
@@ -958,7 +973,7 @@ static void mrs_free(void *ptr) {
 	return real_free(ptr);
 #endif /* JUST_INTERPOSE */
 
-	mrs_debug_printf("mrs_free: called address %p\n", ptr);
+	/*mrs_debug_printf("mrs_free: called address %p\n", ptr);*/
 
 	void *ins = ptr;
 
@@ -1029,7 +1044,17 @@ static void *mrs_offload_thread(void *arg) {
 			}
 		}
 
+#ifdef PRINT_CAPREVOKE
+		mrs_printf("mrs_offload_thread: flushing validated quarantine size %zu\n", offload_quarantine.size);
+#endif /* PRINT_CAPREVOKE */
+
 		quarantine_flush(&offload_quarantine);
+
+#ifdef PRINT_CAPREVOKE
+		mrs_printf("mrs_offload_thread: application quarantine's (unvalidated) size"
+		    "when offloaded quarantine flush complete: %zu\n",
+		    application_quarantine.size);
+#endif /* PRINT_CAPREVOKE */
 
 		if (pthread_cond_signal(&offload_quarantine_empty)) {
 				mrs_printf("pthread error\n");
