@@ -348,12 +348,13 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
 	if (quarantine->size > quarantine->max_size) {
 		quarantine->max_size = quarantine->size;
 	}
-#ifdef PRINT_CAPREVOKE
+
 	if (quarantine->size > allocated_size) {
-		mrs_printf("quarantine size %zu exceeded allocated_size %zu inserting the following cap\n", quarantine->size, allocated_size);
-		mrs_printcap("inserted", ins);
+		mrs_printf("fatal error: quarantine size %zu exceeded allocated_size %zu "
+		    "inserting the following cap\n", quarantine->size, allocated_size);
+		mrs_printcap("inserted", ptr);
+		exit(7);
 	}
-#endif /* PRINT_CAPREVOKE */
 }
 
 /*
@@ -663,14 +664,16 @@ if (quarantine_should_flush(&application_quarantine)) {
 #endif /* PRINT_CAPREVOKE */
 		mrs_lock(&offload_quarantine_lock);
 		while (offload_quarantine.list != NULL) {
+#ifdef PRINT_CAPREVOKE
 			mrs_printf("check_and_perform_flush (offload): waiting for offload_quarantine to drain\n");
+#endif /* PRINT_CAPREVOKE */
 			if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
 				mrs_printf("pthread error\n");
 				exit(7);
 			}
 		}
-		mrs_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
 #ifdef PRINT_CAPREVOKE
+		mrs_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
 		mrs_printf("check_and_perform flush: cycle count after waiting on offload %" PRIu64 "\n", caprevoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
 
@@ -1023,13 +1026,17 @@ static void *mrs_offload_thread(void *arg) {
 	mrs_lock(&offload_quarantine_lock);
 	for (;;) {
 		while (offload_quarantine.list == NULL) {
-			mrs_debug_printf("mrs_offload_thread: waiting for offload_quarantine to be ready\n");
+#ifdef PRINT_CAPREVOKE
+			mrs_printf("mrs_offload_thread: waiting for offload_quarantine to be ready\n");
+#endif /* PRINT_CAPREVOKE */
 			if (pthread_cond_wait(&offload_quarantine_ready, &offload_quarantine_lock)) {
 				mrs_printf("pthread error\n");
 				exit(7);
 			}
 		}
+#ifdef PRINT_CAPREVOKE
 		mrs_debug_printf("mrs_offload_thread: offload_quarantine ready\n");
+#endif /* PRINT_CAPREVOKE */
 
 		/* re-calculate the quarantine's size using only valid descriptors. */
 		offload_quarantine.size = 0;
@@ -1044,14 +1051,12 @@ static void *mrs_offload_thread(void *arg) {
 			}
 		}
 
-#ifdef PRINT_CAPREVOKE
-		mrs_printf("mrs_offload_thread: flushing validated quarantine size %zu\n", offload_quarantine.size);
-#endif /* PRINT_CAPREVOKE */
+		mrs_debug_printf("mrs_offload_thread: flushing validated quarantine size %zu\n", offload_quarantine.size);
 
 		quarantine_flush(&offload_quarantine);
 
 #ifdef PRINT_CAPREVOKE
-		mrs_printf("mrs_offload_thread: application quarantine's (unvalidated) size"
+		mrs_printf("mrs_offload_thread: application quarantine's (unvalidated) size "
 		    "when offloaded quarantine flush complete: %zu\n",
 		    application_quarantine.size);
 #endif /* PRINT_CAPREVOKE */
