@@ -165,10 +165,15 @@ volatile const struct caprevoke_info *cri;
 static size_t page_size;
 static void *entire_shadow;
 
+struct mrs_descriptor_slab_entry {
+	void *ptr;
+	size_t size;
+};
+
 struct mrs_descriptor_slab {
 	int num_descriptors;
 	struct mrs_descriptor_slab *next;
-	void *slab[DESCRIPTOR_SLAB_ENTRIES];
+	struct mrs_descriptor_slab_entry slab[DESCRIPTOR_SLAB_ENTRIES];
 };
 
 struct mrs_quarantine {
@@ -328,7 +333,7 @@ static inline void clear_region(void *mem, size_t len) {
  * just insert a freed allocation into a quarantine, no validation, increase
  * quarantine size by the length of the allocation's capability
  */
-static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr) {
+static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr, size_t size) {
 
 	if (quarantine->list == NULL || quarantine->list->num_descriptors == DESCRIPTOR_SLAB_ENTRIES) {
 		struct mrs_descriptor_slab *ins = alloc_descriptor_slab();
@@ -340,11 +345,12 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
 		quarantine->list = ins;
 	}
 
-	quarantine->list->slab[quarantine->list->num_descriptors] = ptr;
+	quarantine->list->slab[quarantine->list->num_descriptors].ptr = ptr;
+	quarantine->list->slab[quarantine->list->num_descriptors].size = size;
 
 	quarantine->list->num_descriptors++;
 
-	quarantine->size += cheri_getlen(ptr);
+	quarantine->size += size;
 	if (quarantine->size > quarantine->max_size) {
 		quarantine->max_size = quarantine->size;
 	}
@@ -592,21 +598,21 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		for (int i = 0; i < iter->num_descriptors; i++) {
 			/* in the offload case, only clear the bitmap for validated descriptors (cap != NULL) */
 #ifdef OFFLOAD_QUARANTINE
-			if (iter->slab[i] != NULL) {
+			if (iter->slab[i].ptr != NULL) {
 #endif /* OFFLOAD_QUARANTINE */
 
 #if !defined(JUST_QUARANTINE)
 				/* doesn't matter if underlying_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-				caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->slab[i]), __builtin_align_up(cheri_getlen(iter->slab[i]), CAPREVOKE_BITMAP_ALIGNMENT));
+				caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->slab[i].ptr), __builtin_align_up(cheri_getlen(iter->slab[i].ptr), CAPREVOKE_BITMAP_ALIGNMENT));
 				atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
 
 #ifdef CLEAR_ON_FREE
-				clear_region(iter->slab[i], cheri_getlen(iter->slab[i]));
+				clear_region(iter->slab[i].ptr, cheri_getlen(iter->slab[i].ptr));
 #endif /* CLEAR_ON_FREE */
 
 				/* we have a VMMAP-bearing cap from malloc_underlying_allocation */
-				real_free(iter->slab[i]);
+				real_free(iter->slab[i].ptr);
 
 #ifdef OFFLOAD_QUARANTINE
 			}
@@ -1014,7 +1020,8 @@ static void mrs_free(void *ptr) {
 	}
 #endif /* BYPASS_QUARANTINE */
 
-	quarantine_insert(&application_quarantine, ins);
+	/* use passed-in length because, if validated it is guaranteed to be less than the allocated length */
+	quarantine_insert(&application_quarantine, ins, cheri_getlen(ptr));
 
 #ifdef REVOKE_ON_FREE
 	check_and_perform_flush();
@@ -1043,10 +1050,10 @@ static void *mrs_offload_thread(void *arg) {
 		/* iterate through the quarantine validating the freed pointers. */
 		for (struct mrs_descriptor_slab *iter = offload_quarantine.list; iter != NULL; iter = iter->next) {
 			for (int i = 0; i < iter->num_descriptors; i++) {
-				iter->slab[i] = validate_freed_pointer(iter->slab[i]);
+				iter->slab[i].ptr = validate_freed_pointer(iter->slab[i].ptr);
 
-				if (iter->slab[i] != NULL) {
-					offload_quarantine.size += cheri_getlen(iter->slab[i]);
+				if (iter->slab[i].ptr != NULL) {
+					offload_quarantine.size += iter->slab[i].size;
 				}
 			}
 		}
