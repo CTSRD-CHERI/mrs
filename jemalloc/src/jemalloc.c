@@ -208,10 +208,9 @@ typedef struct {
 #else
 #define	BOUND_PTR(ptr, size)	\
     ((config_cheri_setbounds && ptr != NULL) ? \
-    cheri_andperm(cheri_csetbounds((ptr), (size)), \
+    cheri_andperm(cheri_setbounds((ptr), (size)), \
 	CHERI_PERMS_USERSPACE_DATA & ~CHERI_PERM_CHERIABI_VMMAP) : \
     (ptr))
-#define roundup2(x, y)	(((x)+((y)-1))&(~((y)-1)))
 
 /*
  * XXX-BD: In theory this poses an overflow risk.  It's overflow
@@ -3227,7 +3226,7 @@ je_malloc_underlying_allocation(void *ptr) {
 			ret = unbound_ptr(tsdn, ptr);
 			/* use a version of BOUND_PTR that doesn't remove VMMAP permission */
 			ret = ((config_cheri_setbounds && ret != NULL) ?
-			        cheri_andperm(cheri_csetbounds(ret, underlying_size),
+			        cheri_andperm(cheri_setbounds(ret, underlying_size),
 			        CHERI_PERMS_USERSPACE_DATA) : ret);
 		}
 	}

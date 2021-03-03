@@ -147,7 +147,7 @@ void malloc_underlying_allocation_test() {
 	char *underlying = malloc_underlying_allocation(orig);
 	printf("0 underlying %#p original %#p\n", underlying, orig);
 
-	char *restricted = cheri_csetbounds(orig, 4);
+	char *restricted = cheri_setbounds(orig, 4);
 	underlying = malloc_underlying_allocation(restricted);
 	printf("1 underlying %#p restricted %#p\n", underlying, restricted);
 
@@ -155,7 +155,7 @@ void malloc_underlying_allocation_test() {
 	underlying = malloc_underlying_allocation(restricted);
 	printf("2 underlying %#p restricted %#p\n", underlying, restricted);
 
-	restricted = cheri_csetbounds(orig + 4, 4);
+	restricted = cheri_setbounds(orig + 4, 4);
 	underlying = malloc_underlying_allocation(restricted);
 	printf("3 underlying %#p original %#p\n", underlying, orig);
 }
@@ -214,7 +214,7 @@ void malformed_free_addr_goodalign() {
 
 void malformed_free_base_addr_badalign() {
 	char *myptr = (char *)malloc(32);
-	myptr = cheri_csetbounds(myptr + 4, 28);
+	myptr = cheri_setbounds(myptr + 4, 28);
 	printf("freeing %#p\n", myptr);
 	free(myptr);
 	myptr = (char *)malloc(32);
@@ -223,7 +223,7 @@ void malformed_free_base_addr_badalign() {
 
 void malformed_free_base_addr_goodalign() {
 	char *myptr = (char *)malloc(32);
-	myptr = cheri_csetbounds(myptr + 16, 16);
+	myptr = cheri_setbounds(myptr + 16, 16);
 	printf("freeing %#p\n", myptr);
 	free(myptr);
 	myptr = (char *)malloc(32);
