@@ -33,8 +33,10 @@
 #include <sys/mman.h>
 #include <sys/tree.h>
 
-#include <cheri/caprevoke.h>
+#include <cheri/cheri.h>
 #include <cheri/cheric.h>
+#include <sys/caprevoke.h>
+#include <cheri/libcaprevoke.h>
 
 #include <machine/vmparam.h>
 
@@ -73,6 +75,7 @@
  * QUARANTINE_HIGHWATER: limit the quarantine size to QUARANTINE_HIGHWATER number of bytes
  * QUARANTINE_RATIO: limit the quarantine size to 1 / QUARANTINE_RATIO times the size of the heap (default 4)
  * CONCURRENT_REVOCATION_PASSES: number of concurrent revocation pass before the stop-the-world pass
+ * LOAD_SIDE_REVOCATION: use Reloaded, not Cornucopia
  *
  */
 
@@ -450,7 +453,7 @@ static inline void *validate_freed_pointer(void *ptr) {
 	 * actually a 16-byte multiple because all allocations will be 16-byte
 	 * aligned
 	 */
-	if (caprev_shadow_nomap_set_len(entire_shadow, cheri_getbase(ptr), __builtin_align_up(cheri_getlen(underlying_allocation), CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
+	if (caprev_shadow_nomap_set_len(cri->base_mem_nomap, entire_shadow, cheri_getbase(ptr), __builtin_align_up(cheri_getlen(underlying_allocation), CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
 		mrs_debug_printf("validate_freed_pointer: setting bitmap failed\n");
 		return NULL;
 	}
@@ -479,29 +482,32 @@ static inline bool quarantine_should_flush(struct mrs_quarantine *quarantine) {
 static inline uint64_t
 caprevoke_get_cyc(void)
 {
-	uint64_t res;
-
-	__asm__ __volatile__ (
-		".set push\n.set noreorder\nrdhwr %0, $2\n.set pop"
-	      : "=r"(res));
-
-	return res;
+#if defined(__mips__)
+	return cheri_get_cyclecount();
+#elif defined(__riscv)
+	return __builtin_readcyclecounter();
+#else
+	return 0;
+#endif
 }
 
 static inline void
-print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
+print_caprevoke_stats(char *what, struct caprevoke_syscall_info *crsi,
+    uint64_t cycles)
 {
 	mrs_printf("mrs caprevoke %s:"
 		" efin=%" PRIu64
 
-		" psrt=%" PRIu32
 		" psro=%" PRIu32
 		" psrw=%" PRIu32
 
 		" pfro=%" PRIu32
 		" pfrw=%" PRIu32
 
+		" pclg=%" PRIu32
+
 		" pskf=%" PRIu32
+		" pskn=%" PRIu32
 		" psks=%" PRIu32
 
 		" cfnd=%" PRIu32
@@ -513,30 +519,35 @@ print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
 		" pmkc=%" PRIu32
 
 		" pcyc=%" PRIu64
+		" fcyc=%" PRIu64
 		" tcyc=%" PRIu64
 		"\n",
+
 		what,
-		crst->epoch_fini,
+		crsi->epochs.dequeue,
 
-		crst->pages_retried,
-		crst->pages_scan_ro,
-		crst->pages_scan_rw,
+		crsi->stats.pages_scan_ro,
+		crsi->stats.pages_scan_rw,
 
-		crst->pages_faulted_ro,
-		crst->pages_faulted_rw,
+		crsi->stats.pages_faulted_ro,
+		crsi->stats.pages_faulted_rw,
 
-		crst->pages_skip_fast,
-		crst->pages_skip,
+		crsi->stats.fault_visits,
 
-		crst->caps_found,
-		crst->caps_found_revoked,
+		crsi->stats.pages_skip_fast,
+		crsi->stats.pages_skip_nofill,
+		crsi->stats.pages_skip,
 
-		crst->caps_cleared,
+		crsi->stats.caps_found,
+		crsi->stats.caps_found_revoked,
 
-		crst->lines_scan,
-		crst->pages_mark_clean,
+		crsi->stats.caps_cleared,
 
-		crst->page_scan_cycles,
+		crsi->stats.lines_scan,
+		crsi->stats.pages_mark_clean,
+
+		crsi->stats.page_scan_cycles,
+		crsi->stats.fault_cycles,
 		cycles
 	);
 }
@@ -552,43 +563,87 @@ print_caprevoke_stats(char *what, struct caprevoke_stats *crst, uint64_t cycles)
 static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
 	atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
-	caprevoke_epoch start_epoch = cri->epoch_enqueue;
-	struct caprevoke_stats crst;
+	caprevoke_epoch start_epoch = cri->epochs.enqueue;
 
-	while (!caprevoke_epoch_clears(cri->epoch_dequeue, start_epoch)) {
+	while (!caprevoke_epoch_clears(cri->epochs.dequeue, start_epoch)) {
 # ifdef PRINT_CAPREVOKE
+		struct caprevoke_syscall_info crsi = { 0 };
 		uint64_t cyc_init, cyc_fini;
 
-#  if CONCURRENT_REVOCATION_PASSES > 0
+#  if !defined(LOAD_SIDE_REVOCATION)
+#   if CONCURRENT_REVOCATION_PASSES > 0
 		/* Run all concurrent passes as their own syscalls so we can report accurately */
 		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES; i++) {
 			cyc_init = caprevoke_get_cyc();
-			caprevoke(CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
+			caprevoke(CAPREVOKE_EARLY_SYNC | CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
 			cyc_fini = caprevoke_get_cyc();
-			print_caprevoke_stats("concurrent", &crst, cyc_fini - cyc_init);
+			print_caprevoke_stats("concurrent", &crsi, cyc_fini - cyc_init);
 		}
 		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY |
+		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
 		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("final", &crst, cyc_fini - cyc_init);
-#  else /* CONCURRENT_REVOCATION_PASSES */
+		print_caprevoke_stats("final", &crsi, cyc_fini - cyc_init);
+#   else /* CONCURRENT_REVOCATION_PASSES */
 		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY |
+		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
 		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("single", &crst, cyc_fini - cyc_init);
-#  endif /* !CONCURRENT_REVOCATION_PASSES */
+		print_caprevoke_stats("single", &crsi, cyc_fini - cyc_init);
+#   endif /* !CONCURRENT_REVOCATION_PASSES */
+#  else /* LOAD_SIDE_REVOCATION */
+#   if CONCURRENT_REVOCATION_PASSES > 0
+#    if CONCURRENT_REVOCATION_PASSES > 1
+#     error Reloaded cannot use more than one concurrent pass
+#    endif
+		cyc_init = caprevoke_get_cyc();
+		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
+		cyc_fini = caprevoke_get_cyc();
+		print_caprevoke_stats("load-barrier", &crsi, cyc_fini - cyc_init);
+
+		cyc_init = caprevoke_get_cyc();
+		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
+		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
+		cyc_fini = caprevoke_get_cyc();
+		print_caprevoke_stats("load-final", &crsi, cyc_fini - cyc_init);
+#   else /* CONCURRENT_REVOCATION_PASSES */
+		cyc_init = caprevoke_get_cyc();
+		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
+		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
+		cyc_fini = caprevoke_get_cyc();
+		print_caprevoke_stats("load-single", &crsi, cyc_fini - cyc_init);
+#    endif /* !CONCURRENT_REVOCATION_PASSES */
+#  endif
 
 # else /* PRINT_CAPREVOKE */
 
-#  if CONCURRENT_REVOCATION_PASSES > 0
+#  if !defined(LOAD_SIDE_REVOCATION)
+#   if CONCURRENT_REVOCATION_PASSES > 0
 		/* Bundle the last concurrent pass with the last pass */
 		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES - 1; i++) {
-			caprevoke(CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
+			caprevoke(CAPREVOKE_EARLY_SYNC | CAPREVOKE_TAKE_STATS,
+			    start_epoch, NULL);
 		}
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC, start_epoch, &crst);
-#  else
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY, start_epoch, &crst);
-#  endif
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC |
+		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+#   else
+		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY |
+		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+#   endif
+#  else /* LOAD_SIDE_REVOCATION */
+#   if CONCURRENT_REVOCATION_PASSES > 0
+#    if CONCURRENT_REVOCATION_PASSES > 1
+#     error Reloaded cannot use more than one concurrent pass
+#    endif
+		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_TAKE_STATS,
+		    start_epoch, NULL);
+		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
+		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+#   else
+		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
+		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+#   endif
+#  endif /* LOAD_SIDE_REVOCATION */
 
 # endif /* !PRINT_CAPREVOKE */
 
@@ -605,7 +660,7 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 
 #if !defined(JUST_QUARANTINE)
 				/* doesn't matter if underlying_size isn't a 16-byte multiple because all allocations will be 16-byte aligned */
-				caprev_shadow_nomap_clear_len(entire_shadow, cheri_getbase(iter->slab[i].ptr), __builtin_align_up(cheri_getlen(iter->slab[i].ptr), CAPREVOKE_BITMAP_ALIGNMENT));
+				caprev_shadow_nomap_clear_len(cri->base_mem_nomap, entire_shadow, cheri_getbase(iter->slab[i].ptr), __builtin_align_up(cheri_getlen(iter->slab[i].ptr), CAPREVOKE_BITMAP_ALIGNMENT));
 				atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
 
@@ -742,7 +797,8 @@ static void init(void) {
 		exit(7);
 	}
 
-	if (caprevoke_entire_shadow_cap(&entire_shadow)) {
+	if (caprevoke_shadow(CAPREVOKE_SHADOW_NOVMMAP_ENTIRE, NULL,
+	    &entire_shadow)) {
 		mrs_printf("error getting entire shadow cap\n");
 		exit(7);
 	}
