@@ -62,7 +62,8 @@
  * PRINT_STATS: print statistics on exit
  * PRINT_CAPREVOKE: print stats for each caprevoke
  * CLEAR_ON_ALLOC: zero allocated regions as they are allocated (for non-calloc allocation functions)
- * CLEAR_ON_FREE: zero allocated regions as they come out of quarantine
+ * CLEAR_ON_RETURN: zero allocated regions as they come out of quarantine
+ * CLEAR_ON_FREE: zero allocated regions as they are given to us
  * REVOKE_ON_FREE: perform revocation on free rather than during allocation routines
  *
  * JUST_INTERPOSE: just call the real functions
@@ -664,9 +665,9 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 				atomic_thread_fence(memory_order_release); /* don't construct a pointer to a previously revoked region until the bitmap is cleared. */
 #endif /* !JUST_QUARANTINE */
 
-#ifdef CLEAR_ON_FREE
+#ifdef CLEAR_ON_RETURN
 				clear_region(iter->slab[i].ptr, cheri_getlen(iter->slab[i].ptr));
-#endif /* CLEAR_ON_FREE */
+#endif /* CLEAR_ON_RETURN */
 
 				/* we have a VMMAP-bearing cap from malloc_underlying_allocation */
 				real_free(iter->slab[i].ptr);
@@ -1055,6 +1056,10 @@ static void mrs_free(void *ptr) {
 		return;
 	}
 #endif /* !OFFLOAD_QUARANTINE */
+
+#ifdef CLEAR_ON_FREE
+	bzero(cheri_setoffset(ptr, 0), cheri_getlen(ptr));
+#endif
 
 	// TODO revisit coalescing/bypass
 #ifdef BYPASS_QUARANTINE
