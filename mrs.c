@@ -29,13 +29,13 @@
  */
 
 #include <sys/types.h>
-#include <sys/caprevoke.h>
 #include <sys/mman.h>
 #include <sys/tree.h>
+#include <sys/resource.h>
 
 #include <cheri/cheri.h>
 #include <cheri/cheric.h>
-#include <sys/caprevoke.h>
+#include <cheri/revoke.h>
 #include <cheri/libcaprevoke.h>
 
 #include <machine/vmparam.h>
@@ -60,7 +60,7 @@
  * OFFLOAD_QUARANTINE: process full quarantines in a separate thread
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
- * PRINT_CAPREVOKE: print stats for each caprevoke
+ * PRINT_CAPREVOKE: print stats for each CHERI revocation
  * CLEAR_ON_ALLOC: zero allocated regions as they are allocated (for non-calloc allocation functions)
  * CLEAR_ON_RETURN: zero allocated regions as they come out of quarantine
  * CLEAR_ON_FREE: zero allocated regions as they are given to us
@@ -165,7 +165,7 @@ static const size_t CAPREVOKE_BITMAP_ALIGNMENT = sizeof(void *); /* XXX VM_CAPRE
 static const size_t DESCRIPTOR_SLAB_ENTRIES = 10000;
 static const size_t MIN_REVOKE_HEAP_SIZE = 8 * 1024 * 1024;
 
-volatile const struct caprevoke_info *cri;
+volatile const struct cheri_revoke_info *cri;
 static size_t page_size;
 static void *entire_shadow;
 
@@ -454,7 +454,10 @@ static inline void *validate_freed_pointer(void *ptr) {
 	 * actually a 16-byte multiple because all allocations will be 16-byte
 	 * aligned
 	 */
-	if (caprev_shadow_nomap_set_len(cri->base_mem_nomap, entire_shadow, cheri_getbase(ptr), __builtin_align_up(cheri_getlen(underlying_allocation), CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
+	if (caprev_shadow_nomap_set_len(cri->base_mem_nomap, entire_shadow,
+	    cheri_getbase(ptr),
+	    __builtin_align_up(cheri_getlen(underlying_allocation),
+	    CAPREVOKE_BITMAP_ALIGNMENT), ptr)) {
 		mrs_debug_printf("validate_freed_pointer: setting bitmap failed\n");
 		return NULL;
 	}
@@ -481,7 +484,7 @@ static inline bool quarantine_should_flush(struct mrs_quarantine *quarantine) {
 
 #ifdef PRINT_CAPREVOKE
 static inline uint64_t
-caprevoke_get_cyc(void)
+cheri_revoke_get_cyc(void)
 {
 #if defined(__mips__)
 	return cheri_get_cyclecount();
@@ -493,7 +496,7 @@ caprevoke_get_cyc(void)
 }
 
 static inline void
-print_caprevoke_stats(char *what, struct caprevoke_syscall_info *crsi,
+print_cheri_revoke_stats(char *what, struct cheri_revoke_syscall_info *crsi,
     uint64_t cycles)
 {
 	mrs_printf("mrs caprevoke %s:"
@@ -564,55 +567,68 @@ print_caprevoke_stats(char *what, struct caprevoke_syscall_info *crsi,
 static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
 	atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
-	caprevoke_epoch start_epoch = cri->epochs.enqueue;
+	cheri_revoke_epoch start_epoch = cri->epochs.enqueue;
 
-	while (!caprevoke_epoch_clears(cri->epochs.dequeue, start_epoch)) {
+	while (!cheri_revoke_epoch_clears(cri->epochs.dequeue, start_epoch)) {
 # ifdef PRINT_CAPREVOKE
-		struct caprevoke_syscall_info crsi = { 0 };
+		struct cheri_revoke_syscall_info crsi = { 0 };
 		uint64_t cyc_init, cyc_fini;
+
+#if 0
+		// XXX Take the stats structure prior to doing anything else
+		cheri_revoke(CHERI_REVOKE_ONLY_IF_OPEN |
+		    CHERI_REVOKE_IGNORE_START |
+		    CHERI_REVOKE_TAKE_STATS, 0, &crsi);
+		print_caprevoke_stats("prior", &crsi, 0);
+#endif
+		
 
 #  if !defined(LOAD_SIDE_REVOCATION)
 #   if CONCURRENT_REVOCATION_PASSES > 0
 		/* Run all concurrent passes as their own syscalls so we can report accurately */
 		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES; i++) {
-			cyc_init = caprevoke_get_cyc();
-			caprevoke(CAPREVOKE_EARLY_SYNC | CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
-			cyc_fini = caprevoke_get_cyc();
-			print_caprevoke_stats("concurrent", &crsi, cyc_fini - cyc_init);
+			cyc_init = cheri_revoke_get_cyc();
+			cheri_revoke(CHERI_REVOKE_EARLY_SYNC |
+			    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
+			cyc_fini = cheri_revoke_get_cyc();
+			print_cheri_revoke_stats("concurrent", &crsi, cyc_fini - cyc_init);
 		}
-		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY |
-		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
-		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("final", &crsi, cyc_fini - cyc_init);
+		cyc_init = cheri_revoke_get_cyc();
+		cheri_revoke(CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
+		    start_epoch, &crsi);
+		cyc_fini = cheri_revoke_get_cyc();
+		print_cheri_revoke_stats("final", &crsi, cyc_fini - cyc_init);
 #   else /* CONCURRENT_REVOCATION_PASSES */
-		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY |
-		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
-		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("single", &crsi, cyc_fini - cyc_init);
+		cyc_init = cheri_revoke_get_cyc();
+		cheri_revoke(CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
+		    start_epoch, &crsi);
+		cyc_fini = cheri_revoke_get_cyc();
+		print_cheri_revoke_stats("single", &crsi, cyc_fini - cyc_init);
 #   endif /* !CONCURRENT_REVOCATION_PASSES */
 #  else /* LOAD_SIDE_REVOCATION */
 #   if CONCURRENT_REVOCATION_PASSES > 0
 #    if CONCURRENT_REVOCATION_PASSES > 1
 #     error Reloaded cannot use more than one concurrent pass
 #    endif
-		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
-		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("load-barrier", &crsi, cyc_fini - cyc_init);
+		cyc_init = cheri_revoke_get_cyc();
+		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
+		    start_epoch, &crsi);
+		cyc_fini = cheri_revoke_get_cyc();
+		print_cheri_revoke_stats("load-barrier", &crsi, cyc_fini - cyc_init);
 
-		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
-		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
-		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("load-final", &crsi, cyc_fini - cyc_init);
+		cyc_init = cheri_revoke_get_cyc();
+		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
+		cyc_fini = cheri_revoke_get_cyc();
+		print_cheri_revoke_stats("load-final", &crsi, cyc_fini - cyc_init);
 #   else /* CONCURRENT_REVOCATION_PASSES */
-		cyc_init = caprevoke_get_cyc();
-		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
-		    CAPREVOKE_TAKE_STATS, start_epoch, &crsi);
-		cyc_fini = caprevoke_get_cyc();
-		print_caprevoke_stats("load-single", &crsi, cyc_fini - cyc_init);
+		cyc_init = cheri_revoke_get_cyc();
+		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
+		cyc_fini = cheri_revoke_get_cyc();
+		print_cheri_revoke_stats("load-single", &crsi, cyc_fini - cyc_init);
 #    endif /* !CONCURRENT_REVOCATION_PASSES */
 #  endif
 
@@ -622,27 +638,28 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #   if CONCURRENT_REVOCATION_PASSES > 0
 		/* Bundle the last concurrent pass with the last pass */
 		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES - 1; i++) {
-			caprevoke(CAPREVOKE_EARLY_SYNC | CAPREVOKE_TAKE_STATS,
-			    start_epoch, NULL);
+			cheri_revoke(CHERI_REVOKE_EARLY_SYNC |
+			    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 		}
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_EARLY_SYNC |
-		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+		cheri_revoke(CHERI_REVOKE_LAST_PASS | CHERI_REVOKE_EARLY_SYNC |
+		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 #   else
-		caprevoke(CAPREVOKE_LAST_PASS | CAPREVOKE_LAST_NO_EARLY |
-		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+		cheri_revoke(CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
+		    start_epoch, NULL);
 #   endif
 #  else /* LOAD_SIDE_REVOCATION */
 #   if CONCURRENT_REVOCATION_PASSES > 0
 #    if CONCURRENT_REVOCATION_PASSES > 1
 #     error Reloaded cannot use more than one concurrent pass
 #    endif
-		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_TAKE_STATS,
+		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, NULL);
-		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
-		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 #   else
-		caprevoke(CAPREVOKE_LOAD_SIDE | CAPREVOKE_LAST_PASS |
-		    CAPREVOKE_TAKE_STATS, start_epoch, NULL);
+		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 #   endif
 #  endif /* LOAD_SIDE_REVOCATION */
 
@@ -724,7 +741,7 @@ static inline void check_and_perform_flush() {
 if (quarantine_should_flush(&application_quarantine)) {
 		mrs_printf("check_and_perform_flush (offload): passed application_quarantine threshold, offloading: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
 #ifdef PRINT_CAPREVOKE
-		mrs_printf("check_and_perform flush: cycle count before waiting on offload %" PRIu64 "\n", caprevoke_get_cyc());
+		mrs_printf("check_and_perform flush: cycle count before waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
 		mrs_lock(&offload_quarantine_lock);
 		while (offload_quarantine.list != NULL) {
@@ -738,7 +755,7 @@ if (quarantine_should_flush(&application_quarantine)) {
 		}
 #ifdef PRINT_CAPREVOKE
 		mrs_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
-		mrs_printf("check_and_perform flush: cycle count after waiting on offload %" PRIu64 "\n", caprevoke_get_cyc());
+		mrs_printf("check_and_perform flush: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
 
 		offload_quarantine.list = application_quarantine.list;
@@ -792,13 +809,14 @@ static void init(void) {
 		exit(7);
 	}
 
-	int res = caprevoke_shadow(CAPREVOKE_SHADOW_INFO_STRUCT, NULL, (void **)&cri);
+	int res = cheri_revoke_shadow(CHERI_REVOKE_SHADOW_INFO_STRUCT, NULL,
+	    (void **)&cri);
 	if (res != 0) {
 		mrs_printf("error getting kernel caprevoke counters\n");
 		exit(7);
 	}
 
-	if (caprevoke_shadow(CAPREVOKE_SHADOW_NOVMMAP_ENTIRE, NULL,
+	if (cheri_revoke_shadow(CHERI_REVOKE_SHADOW_NOVMMAP_ENTIRE, NULL,
 	    &entire_shadow)) {
 		mrs_printf("error getting entire shadow cap\n");
 		exit(7);

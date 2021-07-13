@@ -31,9 +31,9 @@
 #define _DEBUG
 
 #include <sys/types.h>
-#include <sys/caprevoke.h>
 
 #include <cheri/cheric.h>
+#include <cheri/revoke.h>
 
 #include <assert.h>
 #include <stdio.h>
@@ -42,11 +42,11 @@
 #include <malloc_np.h>
 
 void assert_not_revoked(void *cap) {
-	assert(!caprevoke_is_revoked(cap));
+	assert(!cheri_revoke_is_revoked(cap));
 }
 
 void assert_revoked(void *cap) {
-	assert(caprevoke_is_revoked(cap));
+	assert(cheri_revoke_is_revoked(cap));
 }
 
 /* expects revocation to happen immediately (no quarantine, no offload) */
