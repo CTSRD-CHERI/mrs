@@ -36,17 +36,19 @@
  * https://en.cppreference.com/w/cpp/memory/new/operator_new
  */
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnew-returns-null"
 
 /* version (1) */
 void * operator new(size_t size) {
 	/* don't throw for size 0 allocations because this breaks applications -
 	 * technically this returned pointer should be non-null but pointers returned
 	 * with size 0 can't be dereferenced anyway */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnew-returns-null"
+#pragma clang diagnostic ignored "-Wnonnull"
 	if (size == 0) {
 		return NULL;
 	}
+#pragma clang diagnostic pop
 	void *ret = malloc(size);
 	if (ret == NULL) {
 		throw std::bad_alloc();
@@ -59,17 +61,19 @@ void * operator new[](size_t size) {
 	/* don't throw for size 0 allocations because this breaks applications -
 	 * technically this returned pointer should be non-null but pointers returned
 	 * with size 0 can't be dereferenced anyway */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnew-returns-null"
+#pragma clang diagnostic ignored "-Wnonnull"
 	if (size == 0) {
 		return NULL;
 	}
+#pragma clang diagnostic pop
 	void *ret = malloc(size);
 	if (ret == NULL) {
 		throw std::bad_alloc();
 	}
 	return ret;
 }
-
-#pragma clang diagnostic pop
 
 /* version (5) */
 void * operator new(size_t size, std::nothrow_t&) noexcept {
