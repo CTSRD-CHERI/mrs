@@ -488,8 +488,12 @@ cheri_revoke_get_cyc(void)
 {
 #if defined(__mips__)
 	return cheri_get_cyclecount();
-#elif defined(__riscv) || defined(__aarch64__)
+#elif defined(__riscv)
 	return __builtin_readcyclecounter();
+#elif defined(__aarch64__)
+	uint64_t _val;
+	__asm __volatile("mrs %0, cntvct_el0" : "=&r" (_val));
+	return _val;
 #else
 	return 0;
 #endif
@@ -591,21 +595,21 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 			cheri_revoke(CHERI_REVOKE_EARLY_SYNC |
 			    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
 			cyc_fini = cheri_revoke_get_cyc();
-			print_cheri_revoke_stats("concurrent", &crsi, cyc_fini - cyc_init);
+			print_cheri_revoke_stats("store-concurrent", &crsi, cyc_fini - cyc_init);
 		}
 		cyc_init = cheri_revoke_get_cyc();
 		cheri_revoke(CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
-		print_cheri_revoke_stats("final", &crsi, cyc_fini - cyc_init);
+		print_cheri_revoke_stats("store-final", &crsi, cyc_fini - cyc_init);
 #   else /* CONCURRENT_REVOCATION_PASSES */
 		cyc_init = cheri_revoke_get_cyc();
 		cheri_revoke(CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
-		print_cheri_revoke_stats("single", &crsi, cyc_fini - cyc_init);
+		print_cheri_revoke_stats("store-final", &crsi, cyc_fini - cyc_init);
 #   endif /* !CONCURRENT_REVOCATION_PASSES */
 #  else /* LOAD_SIDE_REVOCATION */
 #   if CONCURRENT_REVOCATION_PASSES > 0
@@ -628,7 +632,7 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
-		print_cheri_revoke_stats("load-single", &crsi, cyc_fini - cyc_init);
+		print_cheri_revoke_stats("load-final", &crsi, cyc_fini - cyc_init);
 #    endif /* !CONCURRENT_REVOCATION_PASSES */
 #  endif
 
