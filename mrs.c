@@ -488,7 +488,7 @@ cheri_revoke_get_cyc(void)
 {
 #if defined(__mips__)
 	return cheri_get_cyclecount();
-#elif defined(__riscv)
+#elif defined(__riscv) || defined(__aarch64__)
 	return __builtin_readcyclecounter();
 #else
 	return 0;
