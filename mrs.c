@@ -32,6 +32,7 @@
 #include <sys/mman.h>
 #include <sys/tree.h>
 #include <sys/resource.h>
+#include <sys/cpuset.h>
 
 #include <cheri/cheri.h>
 #include <cheri/cheric.h>
@@ -807,6 +808,24 @@ static void init(void) {
 	}
 #endif /* OFFLOAD_QUARANTINE */
 
+#ifdef __aarch64__
+	cpuset_t mask = {0};
+	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
+	    (id_t)-1, sizeof(mask), &mask) != 0) {
+		mrs_printf("cpuset_getaffinity failed\n");
+		exit(7);
+	}
+
+	if (CPU_ISSET(2, &mask)) {
+		CPU_CLR(2, &mask);
+		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
+				(id_t)-1, sizeof(mask), &mask) != 0) {
+			mrs_printf("cpuset_setaffinity failed\n");
+			exit(7);
+		}
+	}
+#endif
+
 	page_size = getpagesize();
 	if ((page_size & (page_size - 1)) != 0) {
 		mrs_printf("page_size not a power of 2\n");
@@ -1115,6 +1134,26 @@ static void mrs_free(void *ptr) {
 
 #ifdef OFFLOAD_QUARANTINE
 static void *mrs_offload_thread(void *arg) {
+
+#ifdef __aarch64__
+	cpuset_t mask = {0};
+	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
+	    (id_t)-1, sizeof(mask), &mask) != 0) {
+		mrs_printf("cpuset_getaffinity failed\n");
+		exit(7);
+	}
+
+	if (CPU_ISSET(3, &mask)) {
+		CPU_CLR(3, &mask);
+		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
+				(id_t)-1, sizeof(mask), &mask) != 0) {
+			mrs_printf("cpuset_setaffinity failed\n");
+			exit(7);
+		}
+	}
+#endif
+
+
 	mrs_lock(&offload_quarantine_lock);
 	for (;;) {
 		while (offload_quarantine.list == NULL) {
