@@ -593,20 +593,20 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		/* Run all concurrent passes as their own syscalls so we can report accurately */
 		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES; i++) {
 			cyc_init = cheri_revoke_get_cyc();
-			cheri_revoke(CHERI_REVOKE_EARLY_SYNC |
+			cheri_revoke(CHERI_REVOKE_FORCE_STORE_SIDE | CHERI_REVOKE_EARLY_SYNC |
 			    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
 			cyc_fini = cheri_revoke_get_cyc();
 			print_cheri_revoke_stats("store-concurrent", &crsi, cyc_fini - cyc_init);
 		}
 		cyc_init = cheri_revoke_get_cyc();
-		cheri_revoke(CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_STORE_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
 		print_cheri_revoke_stats("store-final", &crsi, cyc_fini - cyc_init);
 #   else /* CONCURRENT_REVOCATION_PASSES */
 		cyc_init = cheri_revoke_get_cyc();
-		cheri_revoke(CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_STORE_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
@@ -618,19 +618,19 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #     error Reloaded cannot use more than one concurrent pass
 #    endif
 		cyc_init = cheri_revoke_get_cyc();
-		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
+		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
 		print_cheri_revoke_stats("load-barrier", &crsi, cyc_fini - cyc_init);
 
 		cyc_init = cheri_revoke_get_cyc();
-		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
 		print_cheri_revoke_stats("load-final", &crsi, cyc_fini - cyc_init);
 #   else /* CONCURRENT_REVOCATION_PASSES */
 		cyc_init = cheri_revoke_get_cyc();
-		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
 		print_cheri_revoke_stats("load-final", &crsi, cyc_fini - cyc_init);
@@ -643,13 +643,13 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #   if CONCURRENT_REVOCATION_PASSES > 0
 		/* Bundle the last concurrent pass with the last pass */
 		for (int i = 0; i < CONCURRENT_REVOCATION_PASSES - 1; i++) {
-			cheri_revoke(CHERI_REVOKE_EARLY_SYNC |
+			cheri_revoke(CHERI_REVOKE_FORCE_STORE_SIDE | CHERI_REVOKE_EARLY_SYNC |
 			    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 		}
-		cheri_revoke(CHERI_REVOKE_LAST_PASS | CHERI_REVOKE_EARLY_SYNC |
+		cheri_revoke(CHERI_REVOKE_FORCE_STORE_SIDE | CHERI_REVOKE_LAST_PASS | CHERI_REVOKE_EARLY_SYNC |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 #   else
-		cheri_revoke(CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_STORE_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, NULL);
 #   endif
@@ -658,12 +658,12 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #    if CONCURRENT_REVOCATION_PASSES > 1
 #     error Reloaded cannot use more than one concurrent pass
 #    endif
-		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
+		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, NULL);
-		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 #   else
-		cheri_revoke(CHERI_REVOKE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
+		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
 #   endif
 #  endif /* LOAD_SIDE_REVOCATION */
