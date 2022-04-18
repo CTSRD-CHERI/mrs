@@ -613,10 +613,6 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		print_cheri_revoke_stats("store-final", &crsi, cyc_fini - cyc_init);
 #   endif /* !CONCURRENT_REVOCATION_PASSES */
 #  else /* LOAD_SIDE_REVOCATION */
-#   if CONCURRENT_REVOCATION_PASSES > 0
-#    if CONCURRENT_REVOCATION_PASSES > 1
-#     error Reloaded cannot use more than one concurrent pass
-#    endif
 		cyc_init = cheri_revoke_get_cyc();
 		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
@@ -628,13 +624,6 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
 		print_cheri_revoke_stats("load-final", &crsi, cyc_fini - cyc_init);
-#   else /* CONCURRENT_REVOCATION_PASSES */
-		cyc_init = cheri_revoke_get_cyc();
-		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
-		    CHERI_REVOKE_TAKE_STATS, start_epoch, &crsi);
-		cyc_fini = cheri_revoke_get_cyc();
-		print_cheri_revoke_stats("load-final", &crsi, cyc_fini - cyc_init);
-#    endif /* !CONCURRENT_REVOCATION_PASSES */
 #  endif
 
 # else /* PRINT_CAPREVOKE */
@@ -654,18 +643,10 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		    start_epoch, NULL);
 #   endif
 #  else /* LOAD_SIDE_REVOCATION */
-#   if CONCURRENT_REVOCATION_PASSES > 0
-#    if CONCURRENT_REVOCATION_PASSES > 1
-#     error Reloaded cannot use more than one concurrent pass
-#    endif
 		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, NULL);
 		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
 		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
-#   else
-		cheri_revoke(CHERI_REVOKE_FORCE_LOAD_SIDE | CHERI_REVOKE_LAST_PASS |
-		    CHERI_REVOKE_TAKE_STATS, start_epoch, NULL);
-#   endif
 #  endif /* LOAD_SIDE_REVOCATION */
 
 # endif /* !PRINT_CAPREVOKE */
