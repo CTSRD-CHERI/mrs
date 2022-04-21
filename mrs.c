@@ -335,10 +335,12 @@ static inline void clear_region(void *mem, size_t len) {
 }
 
 /*
- * just insert a freed allocation into a quarantine, no validation, increase
+ * just insert a freed allocation into a quarantine, minimal validation, increase
  * quarantine size by the length of the allocation's capability
  */
 static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr, size_t size) {
+  if (!cheri_gettag(ptr))
+    return;
 
 	if (quarantine->list == NULL || quarantine->list->num_descriptors == DESCRIPTOR_SLAB_ENTRIES) {
 		struct mrs_descriptor_slab *ins = alloc_descriptor_slab();
