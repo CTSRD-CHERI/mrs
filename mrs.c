@@ -339,8 +339,8 @@ static inline void clear_region(void *mem, size_t len) {
  * quarantine size by the length of the allocation's capability
  */
 static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *ptr, size_t size) {
-  if (!cheri_gettag(ptr))
-    return;
+  /*if (!cheri_gettag(ptr))*/
+    /*return;*/
 
 	if (quarantine->list == NULL || quarantine->list->num_descriptors == DESCRIPTOR_SLAB_ENTRIES) {
 		struct mrs_descriptor_slab *ins = alloc_descriptor_slab();
@@ -358,16 +358,19 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
 	quarantine->list->num_descriptors++;
 
 	quarantine->size += size;
+  /*mrs_printf("qins %zu addr %p\n", size, ptr);*/
 	if (quarantine->size > quarantine->max_size) {
 		quarantine->max_size = quarantine->size;
 	}
 
+#if 0
 	if (quarantine->size > allocated_size) {
 		mrs_printf("fatal error: quarantine size %zu exceeded allocated_size %zu "
 		    "inserting the following cap\n", quarantine->size, allocated_size);
 		mrs_printcap("inserted", ptr);
 		exit(7);
 	}
+#endif
 }
 
 /*
@@ -388,10 +391,10 @@ static inline void *validate_freed_pointer(void *ptr) {
 	 * untagged check before malloc_underlying_allocation() catches NULL and other invalid
 	 * caps that may cause a rude implementation of malloc_underlying_allocation() to crash.
 	 */
-	/*if (!cheri_gettag(ptr)) {*/
-		/*mrs_debug_printf("validate_freed_pointer: untagged capability\n");*/
-		/*return NULL;*/
-	/*}*/
+  if (!cheri_gettag(ptr)) {
+    mrs_debug_printf("validate_freed_pointer: untagged capability addr %p\n", ptr);
+    return NULL;
+  }
 
 	void *underlying_allocation = malloc_underlying_allocation(ptr);
 	if (underlying_allocation == NULL) {
@@ -861,6 +864,7 @@ static void *mrs_malloc(size_t size) {
 
 	void *allocated_region;
 
+#if 0
 	/*
 	 * ensure that all allocations less than the shadow bitmap granule size are
 	 * aligned to that granule size, so that no two allocations will be governed
@@ -885,6 +889,11 @@ static void *mrs_malloc(size_t size) {
 			return allocated_region;
 		}
 	}
+#endif
+		allocated_region = real_malloc(size);
+		if (allocated_region == NULL) {
+			return allocated_region;
+		}
 
 #ifdef CLEAR_ON_ALLOC
 	clear_region(allocated_region, cheri_getlen(allocated_region));
@@ -936,6 +945,7 @@ void *mrs_calloc(size_t number, size_t size) {
 
 	void *allocated_region;
 
+#if 0
 	/*
 	 * ensure that all allocations less than the shadow bitmap granule size are
 	 * aligned to that granule size, so that no two allocations will be governed
@@ -961,6 +971,11 @@ void *mrs_calloc(size_t number, size_t size) {
 			return allocated_region;
 		}
 	}
+#endif
+		allocated_region = real_calloc(number, size);
+		if (allocated_region == NULL) {
+			return allocated_region;
+		}
 
 	increment_allocated_size(allocated_region);
 
@@ -981,9 +996,11 @@ static int mrs_posix_memalign(void **ptr, size_t alignment, size_t size) {
 	check_and_perform_flush();
 #endif /* !REVOKE_ON_FREE */
 
+#if 0
 	if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
 		alignment = CAPREVOKE_BITMAP_ALIGNMENT;
 	}
+#endif
 
 	int ret = real_posix_memalign(ptr, alignment, size);
 	if (ret != 0) {
@@ -1010,9 +1027,11 @@ static void *mrs_aligned_alloc(size_t alignment, size_t size) {
 	check_and_perform_flush();
 #endif /* !REVOKE_ON_FREE */
 
+#if 0
 	if (alignment < CAPREVOKE_BITMAP_ALIGNMENT) {
 		alignment = CAPREVOKE_BITMAP_ALIGNMENT;
 	}
+#endif
 
 	void *allocated_region = real_aligned_alloc(alignment, size);
 	if (allocated_region == NULL) {
@@ -1108,7 +1127,8 @@ static void mrs_free(void *ptr) {
 #endif /* BYPASS_QUARANTINE */
 
 	/* use passed-in length because, if validated it is guaranteed to be less than the allocated length */
-	quarantine_insert(&application_quarantine, ins, cheri_getlen(ptr));
+	/*quarantine_insert(&application_quarantine, ins, cheri_getlen(ptr));*/
+  quarantine_insert(&application_quarantine, ins, cheri_getlen(ins));
 
 #ifdef REVOKE_ON_FREE
 	check_and_perform_flush();
