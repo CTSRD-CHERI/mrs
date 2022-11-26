@@ -1169,6 +1169,13 @@ static void *mrs_offload_thread(void *arg) {
 	}
 #endif
 
+	/*
+	 * Perform a spurious allocation here to force the allocator to wake
+	 * initialize any thread-local state associated with this thread.
+	 * Do this bypassing the quarantine logic, so that we don't get into
+	 * any stickier mess than we're already in.
+	 */
+	void *p = real_malloc(1);
 
 	mrs_lock(&offload_quarantine_lock);
 	for (;;) {
