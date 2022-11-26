@@ -577,7 +577,7 @@ print_cheri_revoke_stats(char *what, struct cheri_revoke_syscall_info *crsi,
 static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 #if !defined(JUST_QUARANTINE) && !defined(JUST_PAINT_BITMAP)
 	atomic_thread_fence(memory_order_acq_rel); /* don't read epoch until all bitmap painting is done */
-	cheri_revoke_epoch start_epoch = cri->epochs.enqueue;
+	cheri_revoke_epoch_t start_epoch = cri->epochs.enqueue;
 
 	while (!cheri_revoke_epoch_clears(cri->epochs.dequeue, start_epoch)) {
 # ifdef PRINT_CAPREVOKE
@@ -818,14 +818,14 @@ static void init(void) {
 		exit(7);
 	}
 
-	int res = cheri_revoke_shadow(CHERI_REVOKE_SHADOW_INFO_STRUCT, NULL,
+	int res = cheri_revoke_get_shadow(CHERI_REVOKE_SHADOW_INFO_STRUCT, NULL,
 	    (void **)&cri);
 	if (res != 0) {
 		mrs_printf("error getting kernel caprevoke counters\n");
 		exit(7);
 	}
 
-	if (cheri_revoke_shadow(CHERI_REVOKE_SHADOW_NOVMMAP_ENTIRE, NULL,
+	if (cheri_revoke_get_shadow(CHERI_REVOKE_SHADOW_NOVMMAP_ENTIRE, NULL,
 	    &entire_shadow)) {
 		mrs_printf("error getting entire shadow cap\n");
 		exit(7);
