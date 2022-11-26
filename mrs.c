@@ -787,6 +787,19 @@ static void init(void) {
 #ifdef OFFLOAD_QUARANTINE
 	initialize_lock(offload_quarantine_lock);
 
+	/*
+	 * Fire a spurious signal at the condvars now in an attempt to force
+	 * the pthread machinery to initialize them fully now, before the
+	 * application has a chance to start up and fill quarantine.  Otherwise
+	 * there's a chance that we'll attempt allocation while signaling the
+	 * need for revocation during allocation (thereby deadlocking an
+	 * application thread against itself) or while signaling that the
+	 * quarantine is empty (thereby deadlocking the offload thread against
+	 * itself).
+	 */
+	pthread_cond_signal(&offload_quarantine_empty);
+	pthread_cond_signal(&offload_quarantine_ready);
+
 	pthread_t thd;
 	if (pthread_create(&thd, NULL, mrs_offload_thread, NULL)) {
 		mrs_printf("pthread error\n");
