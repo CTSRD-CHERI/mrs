@@ -701,6 +701,51 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 	mrs_debug_printf("quarantine_flush: flushed, allocated_size %zu quarantine->size %zu\n", allocated_size, quarantine->size);
 }
 
+void malloc_revoke()
+{
+#ifdef OFFLOAD_QUARANTINE
+
+#ifdef PRINT_CAPREVOKE
+	mrs_printf("malloc_revoke (offload): waiting for offload_quarantine to drain\n");
+#endif
+
+	mrs_lock(&offload_quarantine_lock);
+	while (offload_quarantine.list != NULL) {
+		if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
+			mrs_printf("pthread error\n");
+			exit(7);
+		}
+	}
+
+#ifdef PRINT_CAPREVOKE
+	mrs_printf("malloc_revoke (offload): offload_quarantine drained\n");
+	mrs_printf("malloc_revoke: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
+#endif /* PRINT_CAPREVOKE */
+
+#ifdef PRINT_CAPREVOKE
+	mrs_printf("malloc_revoke: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
+#endif /* PRINT_CAPREVOKE */
+
+	offload_quarantine.list = application_quarantine.list;
+	offload_quarantine.size = application_quarantine.size;
+	application_quarantine.list = NULL;
+	application_quarantine.size = 0;
+
+	mrs_unlock(&offload_quarantine_lock);
+	if (pthread_cond_signal(&offload_quarantine_ready)) {
+		mrs_printf("pthread error\n");
+		exit(7);
+	}
+
+#else /* OFFLOAD_QUARANTINE */
+
+#ifdef PRINT_CAPREVOKE
+	mrs_printf("malloc_revoke\n");
+#endif
+	quarantine_flush(&application_quarantine);
+#endif /* OFFLOAD_QUARANTINE */
+}
+
 /*
  * check whether we should flush based on the quarantine policy and perform the
  * flush if so.  takes into account whether offload is enabled or not.
@@ -718,54 +763,31 @@ static inline void check_and_perform_flush() {
 	// TODO perhaps allow the application to continue when we are past the high
 	// water mark instead of blocking for the offload thread to finish flushing
 
-/*
- * we trigger a revocation pass when the unvalidated quarantine hits the
- * highwater mark because if we waited until the validated queue passed the
- * highwater mark, the allocated size might increase (allocations made) between
- * the unvalidated queue and validated queue filling such that the high water
- * mark is no longer hit. this function just fills up the unvalidated
- * quarantine and passes it off when it's full. with offload enabled,
- * the "quarantine" global is unvalidated and passed off to the
- * "offload_quarantine" global then processed in place (list entries that fail
- * validation are not processed).
- */
-if (quarantine_should_flush(&application_quarantine)) {
+	/*
+	 * we trigger a revocation pass when the unvalidated quarantine hits the
+	 * highwater mark because if we waited until the validated queue passed the
+	 * highwater mark, the allocated size might increase (allocations made) between
+	 * the unvalidated queue and validated queue filling such that the high water
+	 * mark is no longer hit. this function just fills up the unvalidated
+	 * quarantine and passes it off when it's full. with offload enabled,
+	 * the "quarantine" global is unvalidated and passed off to the
+	 * "offload_quarantine" global then processed in place (list entries that fail
+	 * validation are not processed).
+	 */
+	if (quarantine_should_flush(&application_quarantine)) {
 		mrs_printf("check_and_perform_flush (offload): passed application_quarantine threshold, offloading: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
 #ifdef PRINT_CAPREVOKE
 		mrs_printf("check_and_perform flush: cycle count before waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
-		mrs_lock(&offload_quarantine_lock);
-		while (offload_quarantine.list != NULL) {
-#ifdef PRINT_CAPREVOKE
-			mrs_printf("check_and_perform_flush (offload): waiting for offload_quarantine to drain\n");
-#endif /* PRINT_CAPREVOKE */
-			if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
-				mrs_printf("pthread error\n");
-				exit(7);
-			}
-		}
-#ifdef PRINT_CAPREVOKE
-		mrs_printf("check_and_perform_flush (offload): offload_quarantine drained\n");
-		mrs_printf("check_and_perform flush: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
-#endif /* PRINT_CAPREVOKE */
 
-		offload_quarantine.list = application_quarantine.list;
-		offload_quarantine.size = application_quarantine.size;
-		application_quarantine.list = NULL;
-		application_quarantine.size = 0;
-
-		mrs_unlock(&offload_quarantine_lock);
-		if (pthread_cond_signal(&offload_quarantine_ready)) {
-			mrs_printf("pthread error\n");
-			exit(7);
-		}
+		malloc_revoke();
 	}
 
 #else /* OFFLOAD_QUARANTINE */
 
 	if (quarantine_should_flush(&application_quarantine)) {
 		mrs_printf("check_and_perform_flush (no offload): passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
-		quarantine_flush(&application_quarantine);
+		malloc_revoke();
 	}
 
 #endif /* !OFFLOAD_QUARANTINE */
