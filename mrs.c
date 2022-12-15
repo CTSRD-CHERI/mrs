@@ -677,8 +677,15 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 				clear_region(iter->slab[i].ptr, cheri_getlen(iter->slab[i].ptr));
 #endif /* CLEAR_ON_RETURN */
 
-				/* we have a VMMAP-bearing cap from malloc_underlying_allocation */
-				real_free(iter->slab[i].ptr);
+				/* we have a VMEM-bearing cap from malloc_underlying_allocation */
+				/*
+				 * XXX: We used to rely on the underlying allocator to rederive caps
+				 * but snmalloc2's CHERI support doesn't do that by default, so we'll
+				 * clear VMEM here.  This feels wrong, somehow; perhaps we want to
+				 * retry with snmalloc1 not doing rederivation now that we're doing
+				 * this?
+				 */
+				real_free(__builtin_cheri_perms_and(iter->slab[i].ptr, ~CHERI_PERM_SW_VMEM));
 
 #ifdef OFFLOAD_QUARANTINE
 			}
