@@ -46,7 +46,7 @@
  */
 
 #define LG_SIZE_CLASS_GROUP	2
-#define LG_TINY_MIN		3
+#define LG_TINY_MIN		4
 // XXX BFG changed LG_TINY_MIN from 3 to 4 to make the minimum alignment 16 for
 // jemalloc (required for old version of shim layer)
 
