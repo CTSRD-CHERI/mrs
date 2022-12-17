@@ -44,6 +44,9 @@ option(JUST_BOOKKEEPING "just update data structures then call the real function
 option(JUST_QUARANTINE "just do bookkeeping and quarantining (no bitmap painting or revocation)" OFF)
 option(JUST_PAINT_BITMAP "do bookkeeping, quarantining, and bitmap painting but no revocation" OFF)
 
+option(SNMALLOC_FLUSH "assume the existence of snmalloc_flush_message_queue()" OFF)
+option(SNMALLOC_PRINT_STATS "assume the existence of snmalloc_print_stats()" OFF)
+
 set(VERSION_STRING "\"version")
 
 if(DEBUG)
@@ -91,6 +94,17 @@ if(REVOKE_ON_FREE)
 	target_compile_definitions(mrs PRIVATE REVOKE_ON_FREE)
 	set(VERSION_STRING "${VERSION_STRING} REVOKE_ON_FREE")
 endif()
+if(SNMALLOC_PRINT_STATS)
+	message("defining SNMALLOC_PRINT_STATS")
+	target_compile_definitions(mrs PRIVATE SNMALLOC_PRINT_STATS)
+	set(VERSION_STRING "${VERSION_STRING} SNMALLOC_PRINT_STATS")
+endif()
+if(SNMALLOC_FLUSH)
+	message("defining SNMALLOC_FLUSH")
+	target_compile_definitions(mrs PRIVATE SNMALLOC_FLUSH)
+	set(VERSION_STRING "${VERSION_STRING} SNMALLOC_FLUSH")
+endif()
+
 
 if(JUST_INTERPOSE)
 	message("defining JUST_INTERPOSE")

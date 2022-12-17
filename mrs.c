@@ -81,6 +81,13 @@
  *
  */
 
+#ifdef SNMALLOC_PRINT_STATS
+extern void snmalloc_print_stats(void);
+#endif
+#ifdef SNMALLOC_FLUSH
+extern void snmalloc_flush_message_queue(void);
+#endif
+
 /* functions */
 
 static void *mrs_malloc(size_t);
@@ -729,8 +736,17 @@ void malloc_revoke()
 	mrs_printf("malloc_revoke: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
 
+#ifdef SNMALLOC_FLUSH
+	/* Consume pending messages now in our queue */
+	snmalloc_flush_message_queue();
+#endif
+
 #ifdef PRINT_CAPREVOKE
 	mrs_printf("malloc_revoke: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
+
+#ifdef SNMALLOC_PRINT_STATS
+	snmalloc_print_stats();
+#endif
 #endif /* PRINT_CAPREVOKE */
 
 	offload_quarantine.list = application_quarantine.list;
@@ -750,6 +766,14 @@ void malloc_revoke()
 	mrs_printf("malloc_revoke\n");
 #endif
 	quarantine_flush(&application_quarantine);
+#ifdef SNMALLOC_FLUSH
+	/* Consume pending messages now in our queue */
+	snmalloc_flush_message_queue();
+#endif
+#if defined(PRINT_CAPREVOKE) && defined(SNMALLOC_PRINT_STATS)
+	snmalloc_print_stats();
+#endif
+
 #endif /* OFFLOAD_QUARANTINE */
 }
 
