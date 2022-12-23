@@ -59,6 +59,8 @@
  *
  * BYPASS_QUARANTINE: MADV_FREE page-multiple allocations and never free them back to the allocator
  * OFFLOAD_QUARANTINE: process full quarantines in a separate thread
+ * MRS_PINNED_CPUSET: notch out CPU 2 for the offload thread's use
+ *   (if !OFFLOAD_QUARANTINE, this still prevents the application from using CPU 2)
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * PRINT_CAPREVOKE: print stats for each CHERI revocation
@@ -862,6 +864,7 @@ static void init(void) {
 	}
 #endif /* OFFLOAD_QUARANTINE */
 
+#ifdef MRS_PINNED_CPUSET
 #ifdef __aarch64__
 	cpuset_t mask = {0};
 	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
@@ -878,6 +881,7 @@ static void init(void) {
 			exit(7);
 		}
 	}
+#endif
 #endif
 
 	page_size = getpagesize();
@@ -1208,6 +1212,7 @@ static void mrs_free(void *ptr) {
 #ifdef OFFLOAD_QUARANTINE
 static void *mrs_offload_thread(void *arg) {
 
+#ifdef MRS_PINNED_CPUSET
 #ifdef __aarch64__
 	cpuset_t mask = {0};
 	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
@@ -1224,6 +1229,7 @@ static void *mrs_offload_thread(void *arg) {
 			exit(7);
 		}
 	}
+#endif
 #endif
 
 	/*
