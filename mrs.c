@@ -806,8 +806,8 @@ static inline void check_and_perform_flush() {
 	 * validation are not processed).
 	 */
 	if (quarantine_should_flush(&application_quarantine)) {
-		mrs_printf("check_and_perform_flush (offload): passed application_quarantine threshold, offloading: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
 #ifdef PRINT_CAPREVOKE
+		mrs_printf("check_and_perform_flush (offload): passed application_quarantine threshold, offloading: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
 		mrs_printf("check_and_perform flush: cycle count before waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
 
@@ -817,7 +817,9 @@ static inline void check_and_perform_flush() {
 #else /* OFFLOAD_QUARANTINE */
 
 	if (quarantine_should_flush(&application_quarantine)) {
+#ifdef PRINT_CAPREVOKE
 		mrs_printf("check_and_perform_flush (no offload): passed application_quarantine threshold, revoking: allocated size %zu quarantine size %zu\n", allocated_size, application_quarantine.size);
+#endif
 		malloc_revoke();
 	}
 
@@ -897,7 +899,9 @@ static void init(void) {
 		exit(7);
 	}
 
+#if defined(PRINT_CAPREVOKE) || defined(PRINT_STATS)
 	mrs_printf(VERSION_STRING);
+#endif
 }
 
 #ifdef PRINT_STATS
