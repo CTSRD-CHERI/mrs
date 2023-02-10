@@ -36,7 +36,8 @@ option(OFFLOAD_QUARANTINE "process the quarantine in a separate worker thread" O
 option(MRS_PINNED_CPUSET "notch out CPU 2 for offload thread" OFF)
 option(BYPASS_QUARANTINE "MADV_FREE freed page-size allocations" OFF)
 option(CLEAR_ON_ALLOC "zero allocated regions as they are allocated (for non-calloc allocation functions)" OFF)
-option(CLEAR_ON_FREE "zero allocated regions as they come out of quarantine" OFF)
+option(CLEAR_ON_FREE "zero allocated regions as they are freed" OFF)
+option(CLEAR_ON_RETURN "zero allocated regions as they come out of quarantine" OFF)
 option(REVOKE_ON_FREE "perform revocation on free rather than during allocation routines" OFF)
 option(LOAD_SIDE_REVOCATION "use Reloaded" OFF)
 
