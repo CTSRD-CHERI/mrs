@@ -783,6 +783,7 @@ void malloc_revoke()
 
 	offload_quarantine.list = application_quarantine.list;
 	offload_quarantine.size = application_quarantine.size;
+	offload_quarantine.max_size = application_quarantine.max_size;
 	application_quarantine.list = NULL;
 	application_quarantine.size = 0;
 
