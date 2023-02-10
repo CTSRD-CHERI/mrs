@@ -651,7 +651,7 @@ static inline void quarantine_flush(struct mrs_quarantine *quarantine) {
 		    CHERI_REVOKE_LAST_NO_EARLY | CHERI_REVOKE_TAKE_STATS,
 		    start_epoch, &crsi);
 		cyc_fini = cheri_revoke_get_cyc();
-		print_cheri_revoke_stats("store-final", &crsi, cyc_fini - cyc_init);
+		print_cheri_revoke_stats("store-oneshot", &crsi, cyc_fini - cyc_init);
 #   endif /* !CONCURRENT_REVOCATION_PASSES */
 #  else /* LOAD_SIDE_REVOCATION */
 		cyc_init = cheri_revoke_get_cyc();
