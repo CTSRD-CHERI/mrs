@@ -45,14 +45,15 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <pthread_np.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-#include "printf.h"
 
 /*
  * Knobs:
@@ -221,10 +222,16 @@ static void *(*real_realloc) (void *, size_t);
 static int (*real_posix_memalign) (void **, size_t, size_t);
 static void *(*real_aligned_alloc) (size_t, size_t);
 
+static inline __attribute__((always_inline)) void mrs_puts(const char *p)
+{
+	size_t n = strlen(p);
+	write(2, p, n);
+}
+
 /* locks */
 
-#define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
-#define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {printf("pthread error\n");exit(7);}} while (0)
+#define mrs_lock(mtx) do {if (pthread_mutex_lock((mtx))) {mrs_puts("pthread error\n");exit(7);}} while (0)
+#define mrs_unlock(mtx) do {if (pthread_mutex_unlock((mtx))) {mrs_puts("pthread error\n");exit(7);}} while (0)
 
 /*
  * hack to initialize mutexes without calling malloc. without this, locking
@@ -250,15 +257,35 @@ pthread_cond_t offload_quarantine_empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t offload_quarantine_ready = PTHREAD_COND_INITIALIZER;
 #endif /* OFFLOAD_QUARANTINE */
 
-/* printf support */
-
 create_lock(printf_lock);
-void _putchar(char character) {
-	write(2, &character, sizeof(char));
-}
+static void mrs_printf(char *fmt, ...)
+{
+	char buf[1024];
+	int n = 0, m;
 
-#define mrs_printf(fmt, ...) \
-	do {mrs_lock(&printf_lock);printf(("mrs: " fmt), ##__VA_ARGS__);mrs_unlock(&printf_lock);} while (0)
+	va_list va;
+	va_start(va, fmt);
+
+	m = snprintf(buf, sizeof(buf), "mrs[%d]: ", getpid());
+	if (m < 0)
+	{
+		abort();
+	}
+	n += m;
+	n = (n > sizeof(buf)) ? sizeof(buf) : n;
+
+	m = vsnprintf(buf+n, sizeof(buf)-n, fmt, va);
+	if (m < 0)
+	{
+		abort();
+	}
+	n += m;
+	n = (n > sizeof(buf)) ? sizeof(buf) : n;
+
+	mrs_lock(&printf_lock);
+	write(2, buf, n);
+	mrs_unlock(&printf_lock);
+}
 
 #define mrs_printcap(name, cap) \
 	mrs_printf("capability %s: v:%u s:%u p:%08lx b:%016lx l:%016lx, o:%lx t:%ld\n", (name), cheri_gettag((cap)), cheri_getsealed((cap)), cheri_getperm((cap)), cheri_getbase((cap)), cheri_getlen((cap)), cheri_getoffset((cap)), cheri_gettype((cap)))
@@ -354,7 +381,7 @@ static inline void quarantine_insert(struct mrs_quarantine *quarantine, void *pt
 	if (quarantine->list == NULL || quarantine->list->num_descriptors == DESCRIPTOR_SLAB_ENTRIES) {
 		struct mrs_descriptor_slab *ins = alloc_descriptor_slab();
 		if (ins == NULL) {
-			mrs_printf("quarantine_insert: couldn't allocate new descriptor slab\n");
+			mrs_puts("quarantine_insert: couldn't allocate new descriptor slab\n");
 			exit(7);
 		}
 		ins->next = quarantine->list;
@@ -722,19 +749,19 @@ void malloc_revoke()
 #ifdef OFFLOAD_QUARANTINE
 
 #ifdef PRINT_CAPREVOKE
-	mrs_printf("malloc_revoke (offload): waiting for offload_quarantine to drain\n");
+	mrs_puts("malloc_revoke (offload): waiting for offload_quarantine to drain\n");
 #endif
 
 	mrs_lock(&offload_quarantine_lock);
 	while (offload_quarantine.list != NULL) {
 		if (pthread_cond_wait(&offload_quarantine_empty, &offload_quarantine_lock)) {
-			mrs_printf("pthread error\n");
+			mrs_puts("pthread error\n");
 			exit(7);
 		}
 	}
 
 #ifdef PRINT_CAPREVOKE
-	mrs_printf("malloc_revoke (offload): offload_quarantine drained\n");
+	mrs_puts("malloc_revoke (offload): offload_quarantine drained\n");
 	mrs_printf("malloc_revoke: cycle count after waiting on offload %" PRIu64 "\n", cheri_revoke_get_cyc());
 #endif /* PRINT_CAPREVOKE */
 
@@ -758,14 +785,14 @@ void malloc_revoke()
 
 	mrs_unlock(&offload_quarantine_lock);
 	if (pthread_cond_signal(&offload_quarantine_ready)) {
-		mrs_printf("pthread error\n");
+		mrs_puts("pthread error\n");
 		exit(7);
 	}
 
 #else /* OFFLOAD_QUARANTINE */
 
 #ifdef PRINT_CAPREVOKE
-	mrs_printf("malloc_revoke\n");
+	mrs_puts("malloc_revoke\n");
 #endif
 	quarantine_flush(&application_quarantine);
 #ifdef SNMALLOC_FLUSH
@@ -859,7 +886,7 @@ static void init(void) {
 
 	pthread_t thd;
 	if (pthread_create(&thd, NULL, mrs_offload_thread, NULL)) {
-		mrs_printf("pthread error\n");
+		mrs_puts("pthread error\n");
 		exit(7);
 	}
 #endif /* OFFLOAD_QUARANTINE */
@@ -869,7 +896,7 @@ static void init(void) {
 	cpuset_t mask = {0};
 	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
 	    (id_t)-1, sizeof(mask), &mask) != 0) {
-		mrs_printf("cpuset_getaffinity failed\n");
+		mrs_puts("cpuset_getaffinity failed\n");
 		exit(7);
 	}
 
@@ -877,7 +904,7 @@ static void init(void) {
 		CPU_CLR(2, &mask);
 		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
 				(id_t)-1, sizeof(mask), &mask) != 0) {
-			mrs_printf("cpuset_setaffinity failed\n");
+			mrs_puts("cpuset_setaffinity failed\n");
 			exit(7);
 		}
 	}
@@ -886,25 +913,25 @@ static void init(void) {
 
 	page_size = getpagesize();
 	if ((page_size & (page_size - 1)) != 0) {
-		mrs_printf("page_size not a power of 2\n");
+		mrs_puts("page_size not a power of 2\n");
 		exit(7);
 	}
 
 	int res = cheri_revoke_get_shadow(CHERI_REVOKE_SHADOW_INFO_STRUCT, NULL,
 	    (void **)&cri);
 	if (res != 0) {
-		mrs_printf("error getting kernel caprevoke counters\n");
+		mrs_puts("error getting kernel caprevoke counters\n");
 		exit(7);
 	}
 
 	if (cheri_revoke_get_shadow(CHERI_REVOKE_SHADOW_NOVMMAP_ENTIRE, NULL,
 	    &entire_shadow)) {
-		mrs_printf("error getting entire shadow cap\n");
+		mrs_puts("error getting entire shadow cap\n");
 		exit(7);
 	}
 
 #if defined(PRINT_CAPREVOKE) || defined(PRINT_STATS)
-	mrs_printf(VERSION_STRING);
+	mrs_puts(VERSION_STRING);
 #endif
 }
 
@@ -995,7 +1022,7 @@ static void *mrs_calloc_bootstrap(size_t number, size_t size) {
 	size_t old_offset = offset;
 	offset += (number * size);
 	if (offset > BOOTSTRAP_CALLOC_SIZE) {
-		mrs_printf("mrs_calloc_bootstrap: ran out of memory\n");
+		mrs_puts("mrs_calloc_bootstrap: ran out of memory\n");
 		exit(7);
 	}
 	return &mem[old_offset];
@@ -1217,7 +1244,7 @@ static void *mrs_offload_thread(void *arg) {
 	cpuset_t mask = {0};
 	if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
 	    (id_t)-1, sizeof(mask), &mask) != 0) {
-		mrs_printf("cpuset_getaffinity failed\n");
+		mrs_puts("cpuset_getaffinity failed\n");
 		exit(7);
 	}
 
@@ -1225,7 +1252,7 @@ static void *mrs_offload_thread(void *arg) {
 		CPU_CLR(3, &mask);
 		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
 				(id_t)-1, sizeof(mask), &mask) != 0) {
-			mrs_printf("cpuset_setaffinity failed\n");
+			mrs_puts("cpuset_setaffinity failed\n");
 			exit(7);
 		}
 	}
@@ -1244,10 +1271,10 @@ static void *mrs_offload_thread(void *arg) {
 	for (;;) {
 		while (offload_quarantine.list == NULL) {
 #ifdef PRINT_CAPREVOKE
-			mrs_printf("mrs_offload_thread: waiting for offload_quarantine to be ready\n");
+			mrs_puts("mrs_offload_thread: waiting for offload_quarantine to be ready\n");
 #endif /* PRINT_CAPREVOKE */
 			if (pthread_cond_wait(&offload_quarantine_ready, &offload_quarantine_lock)) {
-				mrs_printf("pthread error\n");
+				mrs_puts("pthread error\n");
 				exit(7);
 			}
 		}
@@ -1279,7 +1306,7 @@ static void *mrs_offload_thread(void *arg) {
 #endif /* PRINT_CAPREVOKE */
 
 		if (pthread_cond_signal(&offload_quarantine_empty)) {
-				mrs_printf("pthread error\n");
+				mrs_puts("pthread error\n");
 				exit(7);
 		}
 	}
