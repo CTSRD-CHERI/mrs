@@ -1207,7 +1207,11 @@ static void mrs_free(void *ptr) {
 	 * if not offloading, validate the passed-in cap here and replace it with the
 	 * cap to its underlying allocation
 	 */
-#ifndef OFFLOAD_QUARANTINE
+#ifdef OFFLOAD_QUARANTINE
+	if (ins == NULL) {
+		return;
+	}
+#else
 	ins = validate_freed_pointer(ptr);
 	if (ins == NULL) {
 		mrs_debug_printf("mrs_free: validation failed\n");
