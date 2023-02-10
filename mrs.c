@@ -857,18 +857,9 @@ static inline void check_and_perform_flush() {
 
 /* constructor and destructor */
 
-__attribute__((constructor))
-static void init(void) {
-	real_malloc = dlsym(RTLD_NEXT, "malloc");
-	real_free = dlsym(RTLD_NEXT, "free");
-	real_calloc = dlsym(RTLD_NEXT, "calloc");
-	real_realloc = dlsym(RTLD_NEXT, "realloc");
-	real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
-	real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
-
-	initialize_lock(printf_lock);
-
 #ifdef OFFLOAD_QUARANTINE
+static void spawn_background(void)
+{
 	initialize_lock(offload_quarantine_lock);
 
 	/*
@@ -889,6 +880,23 @@ static void init(void) {
 		mrs_puts("pthread error\n");
 		exit(7);
 	}
+}
+#endif /* OFFLOAD_QUARANTINE */
+
+__attribute__((constructor))
+static void init(void) {
+	real_malloc = dlsym(RTLD_NEXT, "malloc");
+	real_free = dlsym(RTLD_NEXT, "free");
+	real_calloc = dlsym(RTLD_NEXT, "calloc");
+	real_realloc = dlsym(RTLD_NEXT, "realloc");
+	real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+	real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
+
+	initialize_lock(printf_lock);
+
+#ifdef OFFLOAD_QUARANTINE
+	spawn_background();
+	pthread_atfork(NULL, NULL, spawn_background);
 #endif /* OFFLOAD_QUARANTINE */
 
 #ifdef MRS_PINNED_CPUSET
