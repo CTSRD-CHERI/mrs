@@ -61,7 +61,12 @@
  * BYPASS_QUARANTINE: MADV_FREE page-multiple allocations and never free them back to the allocator
  * OFFLOAD_QUARANTINE: process full quarantines in a separate thread
  * MRS_PINNED_CPUSET: notch out CPU 2 for the offload thread's use
- *   (if !OFFLOAD_QUARANTINE, this still prevents the application from using CPU 2)
+ *   The background thread notches out CPU 3 from its affinity, leaving it wholely for the application.
+ *   Both threads are, by default, willing to run on CPUs 0 and 1, but we expect that the environment
+ *   has restricted the default CPU set to only 0 and 1 and left 2 and 3 available for the program
+ *   under test and its revoker thread.
+ *
+ *   If !OFFLOAD_QUARANTINE, this still prevents the application from using CPU 2.
  * DEBUG: print debug statements
  * PRINT_STATS: print statistics on exit
  * PRINT_CAPREVOKE: print stats for each CHERI revocation
