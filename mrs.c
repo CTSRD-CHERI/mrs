@@ -919,13 +919,12 @@ static void init(void) {
 		exit(7);
 	}
 
-	if (CPU_ISSET(2, &mask)) {
-		CPU_CLR(2, &mask);
-		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
-				(id_t)-1, sizeof(mask), &mask) != 0) {
-			mrs_puts("cpuset_setaffinity failed\n");
-			exit(7);
-		}
+	CPU_CLR(2, &mask);
+	CPU_SET(3, &mask);
+	if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
+			(id_t)-1, sizeof(mask), &mask) != 0) {
+		mrs_printf("cpuset_setaffinity failed for fg thread: %d\n", errno);
+		exit(7);
 	}
 #endif
 #endif
@@ -1275,13 +1274,12 @@ static void *mrs_offload_thread(void *arg) {
 		exit(7);
 	}
 
-	if (CPU_ISSET(3, &mask)) {
-		CPU_CLR(3, &mask);
-		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
-				(id_t)-1, sizeof(mask), &mask) != 0) {
-			mrs_puts("cpuset_setaffinity failed\n");
-			exit(7);
-		}
+	CPU_SET(2, &mask);
+	CPU_CLR(3, &mask);
+	if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID,
+			(id_t)-1, sizeof(mask), &mask) != 0) {
+		mrs_printf("cpuset_setaffinity failed for bg thread: %d\n", errno);
+		exit(7);
 	}
 #endif
 #endif
