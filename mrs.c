@@ -34,6 +34,10 @@
 #include <sys/resource.h>
 #include <sys/cpuset.h>
 
+#ifdef PRINT_RUSAGE_FINI
+#include <sys/sysctl.h>
+#endif
+
 #include <cheri/cheri.h>
 #include <cheri/cheric.h>
 #include <cheri/revoke.h>
@@ -953,16 +957,63 @@ static void init(void) {
 #endif
 }
 
-#ifdef PRINT_STATS
 __attribute__((destructor))
 static void fini(void) {
+#ifdef PRINT_STATS
 #ifdef OFFLOAD_QUARANTINE
 	mrs_printf("fini: heap size %zu, max heap size %zu, offload quarantine size %zu, max offload quarantine size %zu\n", allocated_size, max_allocated_size, offload_quarantine.size, offload_quarantine.max_size);
 #else /* OFFLOAD_QUARANTINE */
 	mrs_printf("fini: heap size %zu, max heap size %zu, quarantine size %zu, max quarantine size %zu\n", allocated_size, max_allocated_size, application_quarantine.size, application_quarantine.max_size);
 #endif /* !OFFLOAD_QUARANTINE */
-}
 #endif /* PRINT_STATS */
+
+#ifdef PRINT_RUSAGE_FINI
+	{
+	int pid = getpid();
+	struct rusage ru = { 0 };
+	char buf[1024];
+	char ptitle[256];
+
+	getrusage(RUSAGE_SELF, &ru);
+
+	{
+		int sysctl_name[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ARGS, pid };
+		size_t len = sizeof(buf);
+		int error = sysctl(sysctl_name, 4, ptitle, &len, NULL, 0);
+		if (error || len == 0)
+		{
+			ptitle[0] = '\0';
+		}
+	}
+
+	ssize_t n = snprintf(buf, sizeof buf,
+		"mrs[%d; %s] fini eenq=%" PRIu64
+		" ru=[ user=%jd.%02ld sys=%jd.%02ld maxrss=%ld"
+		" fmaj=%ld fmin=%ld swap=%ld blkin=%ld blkou=%ld msgs=%ld"
+		" msgr=%ld sgnl=%ld vcs=%ld ics=%ld ]\n",
+
+		pid, ptitle,
+		/*
+		 * Final enqueue epoch (which clocks "faster", so we can see if
+		 * we're exiting with revocation still active) or -1 if we have
+		 * failed to initialize for some reason.
+		 */
+		cri ? cri->epochs.enqueue : (uint64_t)(-1),
+
+		(intmax_t)ru.ru_utime.tv_sec, ru.ru_utime.tv_usec/10000,
+		(intmax_t)ru.ru_stime.tv_sec, ru.ru_stime.tv_usec/10000,
+		ru.ru_maxrss,
+
+		ru.ru_majflt, ru.ru_minflt, ru.ru_nswap, ru.ru_inblock,
+		ru.ru_oublock, ru.ru_msgsnd,
+		
+		ru.ru_msgrcv, ru.ru_nsignals, ru.ru_nvcsw, ru.ru_nivcsw
+		);
+
+	write(2, buf, n);
+	}
+#endif
+}
 
 /* mrs functions */
 
